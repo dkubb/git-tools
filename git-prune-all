@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# Prune all merged local and remote branches
+
+set -euo pipefail
+IFS=$'\n\t'
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+remote=$(git config "branch.${branch}.remote")
+
+git remote update > /dev/null
+git remote prune "$remote"
+
+git branch --remotes --merged "$remote/$branch" \
+  | awk -F\"/\" "!/(>|$branch)/ {print \$2}" \
+  | xargs --no-run-if-empty --max-lines 1 git push "$remote" --delete

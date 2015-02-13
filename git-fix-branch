@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Fix branch commit data to be the same as author data
+
+set -euo pipefail
+IFS=$'\n\t'
+
+parent=${1-master}
+
+# The command to execute for each commit
+read -r -d '' command <<-'COMMAND' || true
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+COMMAND
+
+# Rebase the current branch on top of the parent
+git rebase --keep-empty -- $parent
+
+# Rewrite all commits against the current commit
+git filter-branch --force --env-filter "$command" -- "$parent..HEAD"
