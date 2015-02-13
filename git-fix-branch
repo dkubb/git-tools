@@ -5,7 +5,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-parent=${1-master}
+parent=${1-$(git merge-base --fork-point origin/master HEAD)}
 
 # The command to execute for each commit
 read -r -d '' command <<-'COMMAND' || true

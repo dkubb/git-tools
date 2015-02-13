@@ -5,7 +5,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-parent=${1-master}
+parent=${1-$(git merge-base --fork-point origin/master HEAD)}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config "branch.${branch}.remote")
 
