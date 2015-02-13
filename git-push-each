@@ -9,12 +9,8 @@ parent=${1-master}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config "branch.${branch}.remote")
 
-# Commits in the local branch not in the remote branch
-commits=$(
-  comm -13 \
-    <(git rev-list "$remote/$parent..$remote/$branch" --reverse) \
-    <(git rev-list "$parent..$branch" --reverse)
-)
+# Commits in the current branch not in the parent branch
+commits=$(git rev-list "$parent..$branch" --reverse)
 
 # Push all commits not in the parent branch
 for commit in $commits
