@@ -15,7 +15,7 @@ export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
 COMMAND
 
 # Rebase the current branch on top of the parent
-git rebase --keep-empty -- $parent
+git rebase --keep-empty -- "$parent"
 
 # Rewrite all commits against the current commit
 git filter-branch --force --env-filter "$command" -- "$parent..HEAD"
