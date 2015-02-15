@@ -7,14 +7,14 @@ IFS=$'\n\t'
 
 parent=${1-$(git merge-base --fork-point origin/master HEAD)}
 branch=$(git rev-parse --abbrev-ref HEAD)
-remote=$(git config "branch.${branch}.remote")
+remote=$(git config -- "branch.${branch}.remote")
 
 # Commits in the current branch not in the parent branch
-commits=$(git rev-list "$parent..$branch" --reverse)
+commits=$(git rev-list --reverse "$parent..$branch")
 
 # Push all commits not in the parent branch
 for commit in $commits
 do
   # Trigger CI for each commit by pushing them individually
-  git push --force "$remote" "$commit:$branch"
+  git push --force -- "$remote" "$commit:$branch"
 done

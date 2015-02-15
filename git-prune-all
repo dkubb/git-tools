@@ -6,11 +6,11 @@ set -euo pipefail
 IFS=$'\n\t'
 
 branch=$(git rev-parse --abbrev-ref HEAD)
-remote=$(git config "branch.${branch}.remote")
+remote=$(git config -- "branch.${branch}.remote")
 
 git remote update > /dev/null
-git remote prune "$remote"
+git remote prune -- "$remote"
 
 git branch --remotes --merged "$remote/$branch" \
   | awk -F\"/\" "!/(>|$branch)/ {print \$2}" \
-  | xargs --no-run-if-empty --max-lines 1 git push "$remote" --delete
+  | xargs --no-run-if-empty --max-lines 1 git push --delete -- "$remote"
