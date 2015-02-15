@@ -5,14 +5,13 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-parent=${1-$(git merge-base --fork-point origin/master HEAD)}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
-# Commits in the current branch not in the parent branch
-commits=$(git rev-list --reverse "$parent..$branch")
+# Commits in the local branch not in upstream
+commits=$(git rev-list HEAD "^$remote/$branch" --reverse)
 
-# Push all commits not in the parent branch
+# Push all commits not upstream
 for commit in $commits
 do
   # Trigger CI for each commit by pushing them individually
