@@ -8,8 +8,7 @@ IFS=$'\n\t'
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
-git remote update > /dev/null
-git remote prune -- "$remote"
+git remote update --prune > /dev/null
 
 git branch --remotes --merged "$remote/$branch" \
   | awk -F\"/\" "!/(>|$branch)/ {print \$2}" \
