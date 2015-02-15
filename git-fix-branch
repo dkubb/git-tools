@@ -5,7 +5,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-parent=${1-$(git merge-base --fork-point origin/master HEAD)}
+parent=${1-master}
 
 # The command to execute for each commit
 read -r -d '' command <<-'COMMAND' || true
@@ -17,5 +17,5 @@ COMMAND
 # Rebase the current branch on top of the parent
 git rebase --keep-empty -- "$parent"
 
-# Rewrite all commits against the current commit
+# Rewrite all commits to use the author data
 git filter-branch --force --env-filter "$command" -- "$parent..HEAD"
