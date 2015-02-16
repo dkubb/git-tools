@@ -5,11 +5,12 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+parent=${1-master}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
 # Commits in the local branch not in upstream
-commits=$(git rev-list HEAD "^$remote/$branch" --reverse)
+commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
 
 # Push all commits not upstream
 for commit in $commits
