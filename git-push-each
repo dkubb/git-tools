@@ -2,7 +2,7 @@
 
 # Push commits individually to trigger CI builds for each
 
-set -euo pipefail
+set -feuo pipefail
 IFS=$'\n\t'
 
 parent=${1-master}

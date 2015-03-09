@@ -2,7 +2,7 @@
 
 # Prune all merged local and remote branches
 
-set -euo pipefail
+set -feuo pipefail
 IFS=$'\n\t'
 
 branch=$(git rev-parse --abbrev-ref HEAD)

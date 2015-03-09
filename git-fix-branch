@@ -2,7 +2,7 @@
 
 # Fix branch commit data to be the same as author data
 
-set -euo pipefail
+set -feuo pipefail
 IFS=$'\n\t'
 
 parent=${1-master}
