@@ -14,6 +14,7 @@ git remote update --prune > /dev/null
 git branch --remotes --merged "$remote/$branch" \
   | grep "^\s*$remote/" \
   | sed "s/^\s*$remote\///" \
-  | grep -v "^HEAD\b" \
+  | grep -v '^HEAD\b' \
+  | grep -v '^master$' \
   | grep -v "^$branch$" \
   | xargs --no-run-if-empty --max-args 1 git push --delete -- "$remote"
