@@ -16,6 +16,7 @@ git branch --remotes --merged "$remote/$branch" \
   | sed "s/^\s*$remote\///" \
   | grep -v '^HEAD\b' \
   | grep -v '^release/' \
+  | grep -v '^pr/' \
   | grep -v '^master$' \
   | grep -v "^$branch$" \
   | xargs --no-run-if-empty --max-args 1 git push --delete -- "$remote"
