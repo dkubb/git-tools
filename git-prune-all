@@ -12,9 +12,7 @@ git remote update --prune > /dev/null
 
 # TODO: simplify this if possible
 git branch --remotes --merged "$remote/$branch" \
-  | grep "^\s*$remote/" \
-  | sed "s/^\s*$remote\///" \
-  | grep -v '^HEAD\b' \
+  | grep -Po "(?<=^  $remote/)(\S+)$" \
   | grep -v '^release/' \
   | grep -v '^pr/' \
   | grep -v '^master$' \
