@@ -5,7 +5,7 @@
 set -o errexit -o pipefail -o noglob -o noclobber -o nounset
 IFS=$'\n\t'
 
-git ls-tree -z -r --name-only HEAD | parallel --null --quote sh -c '
+git ls-tree -z -r --name-only HEAD | parallel --gnu --null --quote sh -c '
   mtime=$(git log --date=iso -1 --format=%cd "{}");
   touch --date "$mtime" "{}";
   echo "$mtime - {}"
