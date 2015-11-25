@@ -19,5 +19,5 @@ commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
 for commit in $commits
 do
   # Trigger CI for each commit by pushing them individually
-  git push --force -- "$remote" "$commit:$branch"
+  git push --force-with-lease -- "$remote" "$commit:$branch"
 done
