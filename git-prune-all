@@ -8,8 +8,10 @@ IFS=$'\n\t'
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
+# Remove remote references
 git remote update --prune > /dev/null
 
+# Remove remote branches
 git branch --remotes --merged "$remote/$branch" \
   | grep --perl-regexp --only-matching "(?<=^  $remote/)(\S+)$" \
   | grep --invert-match --extended-regexp "^(release/|pr/|master$|${branch}$)" || true \
