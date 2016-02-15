@@ -10,11 +10,7 @@ remote=$(git config -- "branch.${branch}.remote")
 
 git remote update --prune > /dev/null
 
-# TODO: simplify this if possible
 git branch --remotes --merged "$remote/$branch" \
-  | grep -Po "(?<=^  $remote/)(\S+)$" \
-  | grep -v '^release/' \
-  | grep -v '^pr/' \
-  | grep -v '^master$' \
-  | grep -v "^$branch$" \
-  | xargs --no-run-if-empty --max-args 1 git push --delete -- "$remote"
+  | grep --perl-regexp --only-matching "(?<=^  $remote/)(\S+)$" \
+  | grep --invert-match --extended-regexp "^(release/|pr/|master$|${branch}$)" || true \
+  | xargs --no-run-if-empty git push --delete -- "$remote" || true
