@@ -16,3 +16,8 @@ git branch --remotes --merged "$remote/$branch" \
   | grep --perl-regexp --only-matching "(?<=^  $remote/)(\S+)$" \
   | grep --invert-match --extended-regexp "^(release/|pr/|master$|${branch}$)" || true \
   | xargs --no-run-if-empty git push --delete -- "$remote" || true
+
+# Remove local branches
+git branch --merged "$branch" \
+  | grep --invert-match --fixed-strings --line-regexp "* $branch" \
+  | xargs --no-run-if-empty git branch --delete -- || true
