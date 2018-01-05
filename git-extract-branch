@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+# Extract N commits of the current branch to a new branch
+
+set -o errexit -o pipefail -o noglob -o noclobber -o nounset
+IFS=$'\n\t'
+
+main() {
+  local -r             \
+    new_branch=$1      \
+    n_commits=$2       \
+    parent=${3-master} \
+    master=${4-master} \
+    remote=${5-origin}
+
+  local -r branch=$(git rev-parse --abbrev-ref HEAD)
+  local -r new_branch_head=$(
+    git rev-list "$parent".."$branch" | tail -n "$n_commits" | head -n 1
+  )
+
+  echo "Extracting ${new_branch}: ${parent}..${new_branch_head}"
+
+  git fetch "$remote" "${master}:${master}"
+  git fix-branch "$master"
+  git checkout -b "$new_branch" "$master"
+  git cherry-pick "${parent}..${new_branch_head}"
+  git fix-branch "$master"
+
+  if [ "$parent" = "$master" ]; then
+    git checkout "$branch"
+    git rebase "$new_branch"
+    git fix-branch
+    git checkout "$new_branch"
+  fi
+}
+
+main "$@"
