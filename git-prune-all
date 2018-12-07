@@ -18,6 +18,7 @@ git branch --remotes --merged "$remote/$branch" \
   | xargs --no-run-if-empty git push --delete -- "$remote" || true
 
 # Remove local branches
+# shellcheck disable=SC2063
 git branch --merged "$branch" \
   | grep --invert-match --fixed-strings --line-regexp "* $branch" \
   | xargs --no-run-if-empty git branch --delete -- || true
