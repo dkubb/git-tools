@@ -2,8 +2,8 @@
 
 # Fix branch commit data to be the same as author data
 
-set -o errexit -o pipefail -o noglob -o noclobber -o nounset
-IFS=$'\n\t'
+# shellcheck source=/dev/null
+source "${BASH_SOURCE%/*}/strict-mode.sh"
 
 parent=${1-master}
 

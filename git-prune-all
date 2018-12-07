@@ -2,8 +2,8 @@
 
 # Prune all merged local and remote branches
 
-set -o errexit -o pipefail -o noglob -o noclobber -o nounset
-IFS=$'\n\t'
+# shellcheck source=/dev/null
+source "${BASH_SOURCE%/*}/strict-mode.sh"
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
@@ -18,6 +18,7 @@ git branch --remotes --merged "$remote/$branch" \
   | xargs --no-run-if-empty git push --delete -- "$remote" || true
 
 # Remove local branches
+# shellcheck disable=SC2063
 git branch --merged "$branch" \
   | grep --invert-match --fixed-strings --line-regexp "* $branch" \
   | xargs --no-run-if-empty git branch --delete -- || true

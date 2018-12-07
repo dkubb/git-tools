@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# Pull upstream master branch when checking out master locally
+
+# shellcheck source=/dev/null
+source "${BASH_SOURCE%/*}/../strict-mode.sh"
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+if [ "$branch" = 'master' ]; then
+  git pull --rebase
+  git prune-all
+fi
