@@ -2,8 +2,8 @@
 
 # Fix file mtime to match last git commit date
 
-set -o errexit -o pipefail -o noglob -o noclobber -o nounset
-IFS=$'\n\t'
+# shellcheck source=/dev/null
+source "${BASH_SOURCE%/*}/strict-mode.sh"
 
 # shellcheck disable=SC2016
 git ls-tree -z -r --name-only HEAD | parallel --gnu --null --quote sh -c '
