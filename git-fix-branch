@@ -7,7 +7,7 @@ source "${BASH_SOURCE%/*}/strict-mode.sh"
 
 export FILTER_BRANCH_SQUELCH_WARNING=1
 
-parent=${1-master}
+parent=${1-$(git config init.defaultBranch)}
 
 # The command to execute for each commit
 read -r -d '' command <<-'COMMAND' || true

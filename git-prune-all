@@ -13,8 +13,8 @@ git remote update --prune > /dev/null
 
 # Remove remote branches
 git branch --remotes --merged "$remote/$branch" \
-  | grep --perl-regexp --only-matching "(?<=^  $remote/)(\S+)$" \
-  | (grep --invert-match --extended-regexp "^(release/|pr/|master$|${branch}$)" || true) \
+  | perl -lne "print \$1 if m!(?<=^  $remote/)(\S+)\$!" \
+  | (grep --invert-match --extended-regexp "^(release/|pr/|$(git config init.defaultBranch)$|${branch}$)" || true) \
   | xargs --no-run-if-empty git push --delete -- "$remote" || true
 
 # Remove local branches
