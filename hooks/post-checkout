@@ -3,7 +3,7 @@
 # Pull upstream master branch when checking out master locally
 
 # shellcheck source=/dev/null
-source "${BASH_SOURCE%/*}/../strict-mode.sh"
+source "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../strict-mode.sh"
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 
