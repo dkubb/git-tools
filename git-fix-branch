@@ -5,6 +5,8 @@
 # shellcheck source=/dev/null
 source "${BASH_SOURCE%/*}/strict-mode.sh"
 
+export FILTER_BRANCH_SQUELCH_WARNING=1
+
 parent=${1-master}
 
 # The command to execute for each commit
