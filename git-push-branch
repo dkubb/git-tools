@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Push a local branch to a newly created remote using push-each
+
+set -o errexit -o pipefail -o noglob -o noclobber -o nounset
+IFS=$'\n\t'
+
+main() {
+  local -r remote=${1-origin} parent=${2-master}
+  local -r branch=$(git rev-parse --abbrev-ref HEAD)
+
+  echo "Pushing ${branch} to ${remote}/${branch} (parent=$parent)"
+
+  git fetch "$remote" "${parent}:${parent}"
+  git fix-branch "$parent"
+  git push "$remote" "${parent}:${branch}"
+  git branch --set-upstream-to "${remote}/${branch}"
+  git push-each "$parent"
+}
+
+main "$@"
