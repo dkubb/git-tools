@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+# git-extract: Interactive commit history reorganization tool
+#
+# Extract changes from a commit range to create new commits earlier in history,
+# then rebase originals on top. Enables dependency extraction, setup code
+# organization, and commit splitting.
+#
+# WORKFLOW:
+# 1. Checkout final commit state into working tree
+# 2. Break rebase for user to stage/commit desired changes
+# 3. Clean up remaining files that were added in the range
+# 4. Continue rebase with original commit sequence
+#
+# ARCHITECTURE:
+# Wraps `git rebase --interactive` with custom GIT_SEQUENCE_EDITOR.
+# The sequence editor transforms rebase todo files by parsing pick lines
+# and prepending splice commands.
+#
+# KEY INSIGHT:
+# By checking out the end state first, users can selectively commit portions
+# as if they were made earlier, then the rebase machinery handles applying
+# the original commits on top.
+#
+# USAGE:
+#   git extract <rev>|<range>|--root [extra rebase args]
+#
+# EXAMPLES:
+#   git extract HEAD~2    # Splice last 2 commits
+#   git extract abc123^   # Splice from commit abc123 to HEAD
+#   git extract --root    # Splice from root commit
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+source "$script_dir/strict-mode.sh"
+
+if [ $# -eq 0 ]; then
+  echo 'usage: git extract <rev>|<range>|--root [extra rebase args]' >&2
+  exit 2
+fi
+
+editor=${GIT_SEQUENCE_EDITOR:-"${script_dir}/git-extract-seq-editor"}
+
+if [ ! -x "$editor" ]; then
+  echo "error: sequence editor not found or not executable at: $editor" >&2
+  exit 1
+fi
+
+GIT_SEQUENCE_EDITOR=$editor git rebase --interactive "$@"

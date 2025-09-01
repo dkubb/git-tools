@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# git-extract-seq-editor: Custom sequence editor for git-extract
+#
+# Custom rebase sequence editor that loads the final state of a commit range,
+# pauses for user to create new commits from that state, then cleans up and
+# continues with original commits.
+#
+# APPROACH:
+# Transforms rebase todo files by parsing pick lines and prepending extract
+# commands. The sequence editor loads the final state, breaks for user interaction,
+# then handles cleanup of remaining changes.
+#
+# KEY INSIGHT:
+# By checking out the end state first, users can selectively commit portions
+# as if they were made earlier, then the rebase machinery handles applying
+# the original commits on top.
+#
+# WORKFLOW:
+# 1. Parse rebase todo file to find commits being processed
+# 2. Generate prologue with setup commands:
+#    - Load final commit state into working tree
+#    - Break rebase for user to stage/commit changes
+#    - Clean up remaining files that were added in the range
+# 3. Append original rebase todo list after prologue
+#
+# INPUT: Path to git rebase todo file (contains "pick <sha> <message>" lines)
+# OUTPUT: Modified todo file with extract prologue + original content
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+source "$script_dir/strict-mode.sh"
+
+todo_file=${1:?}
+
+# Match commits for pick lines
+mapfile -t commits < <(awk '/^pick[[:space:]]+[0-9A-Fa-f]{7,}/ { print $2 }' < "$todo_file")
+
+if [ ${#commits[@]} -eq 0 ]; then
+  exit
+fi
+
+commit_start=${commits[0]}
+commit_end=${commits[$((${#commits[@]} - 1))]}
+
+# Generate extract prologue commands
+prepend_todo() {
+  # Load final commit state into working tree as unstaged changes
+  echo exec git restore --source "$commit_end" --worktree .
+
+  # Break rebase for user to stage/commit desired changes
+  echo break
+
+  # Remove all files added in the commit range
+  if git rev-parse --verify -q "${commit_start}^" >/dev/null 2>&1; then
+    # Multi-commit range: compare parent of start to end
+    git diff-tree --name-only --diff-filter A "${commit_start}^" "$commit_end"
+  else
+    # Single root commit: use --root flag
+    git diff-tree --name-only --diff-filter A --root "$commit_end"
+  fi | while IFS= read -r path; do
+    printf 'exec git clean --force --quiet -- %q\n' "$path"
+  done
+}
+
+# Generate final todo file: extract prologue + blank line + original todo
+{ prepend_todo; echo; cat "$todo_file"; } | sponge "$todo_file"
