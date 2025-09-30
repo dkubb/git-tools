@@ -1,0 +1,755 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! shell-escape = "0.1.5"
+//! tempfile = "3.2.3"
+//! ```
+//!
+//! Automatically apply fixup! and squash! commits to their targets
+
+use clap::Parser;
+use shell_escape::escape;
+use std::io::Write;
+use std::process::{exit, Command, Stdio};
+
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
+const EXIT_TEMPFAIL: i32 = 75; // conflicts / retryable
+
+#[derive(Parser, Debug)]
+#[command(name = "git-fix")]
+#[command(about = "Automatically apply fixup! and squash! commits to their targets", long_about = None)]
+struct Args {
+    /// Base branch or commit to compare against
+    #[arg(long, default_value = "")]
+    base: String,
+
+    /// Head commit to process fixes from
+    #[arg(long, default_value = "HEAD")]
+    head: String,
+
+    /// Show verbose output
+    #[arg(long, short)]
+    verbose: bool,
+
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Ignore trailing arguments (for git compatibility)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _trailing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CommitType {
+    Fixup,
+    Squash,
+    Pick,
+}
+
+impl CommitType {
+    fn parse_subject(subject: &str) -> (CommitType, Option<&str>) {
+        if let Some(rest) = subject.strip_prefix("fixup! ") {
+            return (CommitType::Fixup, Some(rest));
+        }
+        if let Some(rest) = subject.strip_prefix("squash! ") {
+            return (CommitType::Squash, Some(rest));
+        }
+        (CommitType::Pick, None)
+    }
+}
+
+impl std::fmt::Display for CommitType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitType::Fixup => f.write_str("fixup"),
+            CommitType::Squash => f.write_str("squash"),
+            CommitType::Pick => f.write_str("pick"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Commit {
+    sha: String,
+    subject: String,
+    commit_type: CommitType,
+    target_subject: Option<String>,
+}
+
+struct BranchState {
+    commits: Vec<Commit>,
+    merge_base_sha: String,
+    head_sha: String,
+}
+
+#[derive(Debug)]
+enum GitOperation {
+    Am,
+    Bisect,
+    CherryPick,
+    Merge,
+    Rebase,
+    Revert,
+}
+
+impl std::fmt::Display for GitOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitOperation::Am => f.write_str("am"),
+            GitOperation::Bisect => f.write_str("bisect"),
+            GitOperation::CherryPick => f.write_str("cherry-pick"),
+            GitOperation::Merge => f.write_str("merge"),
+            GitOperation::Rebase => f.write_str("rebase"),
+            GitOperation::Revert => f.write_str("revert"),
+        }
+    }
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Handle --help in trailing args (for git fix -- --help)
+    if args
+        ._trailing
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        Args::parse_from(&["git-fix", "--help"]);
+        return;
+    }
+
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    let script_name = std::env::args()
+        .next()
+        .and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "git-fix".to_string());
+
+    let base_arg = args.base;
+    let head_arg = args.head;
+    let verbose = args.verbose;
+    let dry_run = args.dry_run;
+
+    if let Some(op) = git_operation() {
+        let rerun_cmd = build_rerun_command(&script_name, &base_arg, &head_arg, verbose, dry_run);
+        eprintln!("✗ IN-PROGRESS OPERATION: A {} is currently active.", op);
+        eprintln!(
+            "NEXT: Finish or abort the {} before running: {}",
+            op, rerun_cmd
+        );
+        eprintln!("  - Continue: git {} --continue  (finish the {})", op, op);
+        eprintln!("  - Abort:    git {} --abort     (cancel the {})", op, op);
+        eprintln!("TIP: Run 'git status' to see the current {} state", op);
+        exit(EXIT_TEMPFAIL);
+    }
+
+    let base = if base_arg.is_empty() {
+        let base_branch = git_output(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "origin/HEAD",
+        ]);
+
+        if base_branch.is_empty() {
+            let example_cmd =
+                build_rerun_command(&script_name, "origin/main", &head_arg, verbose, dry_run);
+            eprintln!("✗ ERROR: Cannot determine default branch from origin/HEAD");
+            eprintln!("NEXT: Set origin/HEAD with: git remote set-head origin --auto");
+            eprintln!("OR specify base explicitly with --base flag, e.g.:");
+            eprintln!("  {}", example_cmd);
+            exit(EXIT_DATAERR);
+        }
+        base_branch
+    } else {
+        base_arg
+    };
+
+    let head_sha = resolve_commitish(&head_arg);
+    let base_sha = resolve_commitish(&base);
+    let merge_base_sha = git_output(&["merge-base", &head_sha, &base_sha]);
+
+    // Initialize state
+    let commits = fetch_all_commits(&merge_base_sha, &head_sha);
+    let fix_matches = validate_and_match_fixes(&commits, &merge_base_sha, &head_sha);
+
+    if fix_matches.is_empty() {
+        if verbose {
+            println!("No fixes found");
+        }
+        exit(EXIT_OK);
+    }
+
+    let total_fixes = fix_matches.len();
+    println!(
+        "→ Found {} fix{}",
+        total_fixes,
+        if total_fixes == 1 { "" } else { "es" }
+    );
+
+    let mut state = BranchState {
+        commits,
+        merge_base_sha: merge_base_sha.clone(),
+        head_sha: head_sha.clone(),
+    };
+
+    let mut fixes_applied = 0;
+
+    // Functional loop: apply fixes one at a time
+    while let Some(new_state) =
+        apply_next_fix(state, &script_name, &base, &head_arg, verbose, dry_run)
+    {
+        state = new_state;
+        fixes_applied += 1;
+    }
+
+    if fixes_applied > 0 {
+        if dry_run {
+            println!("✓ DRY RUN COMPLETE (no changes made)");
+        } else {
+            println!("✓ ALL FIXES COMPLETE");
+        }
+    }
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn resolve_commitish(ref_name: &str) -> String {
+    git_output(&["rev-parse", "--verify", &format!("{}^{{commit}}", ref_name)])
+}
+
+/// Detects the current in-progress Git operation using state files under $GIT_DIR.
+/// Precedence:
+///   1) AM: rebase-apply/applying exists (empty marker file)
+///   2) REBASE (merge backend): rebase-merge/git-rebase-todo has commit actions OR (head-name exists + onto is valid commit)
+///   3) REBASE (apply backend): rebase-apply has next/last (valid range) + onto (valid commit)
+///   4) CHERRY_PICK: CHERRY_PICK_HEAD exists and contains valid commit SHA
+///   5) REVERT: REVERT_HEAD exists and contains valid commit SHA
+///   6) MERGE: MERGE_HEAD exists and contains valid commit SHA
+///   7) Sequencer fallback: sequencer/todo has actionable command (pick|revert) when no HEAD files exist
+///   8) BISECT: BISECT_HEAD exists and contains valid commit SHA
+/// Returns None if no in-progress operation is detected.
+fn git_operation() -> Option<GitOperation> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    // Commands that operate on commits (vs meta-commands like exec, break, label, etc.)
+    const COMMIT_ACTIONS: &[&str] = &[
+        "p", "pick", "r", "reword", "e", "edit", "s", "squash", "f", "fixup", "d", "drop", "m",
+        "merge",
+    ];
+
+    // Get git directory once and use as base for all paths
+    let git_dir = Command::new("git")
+        .args(&["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            out.status
+                .success()
+                .then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        })?;
+
+    let git_path = |segments: &[&str]| segments.iter().fold(git_dir.clone(), |p, s| p.join(s));
+
+    // Check if a file exists (for marker files like 'applying')
+    let file_exists = |segments: &[&str]| -> bool { git_path(segments).is_file() };
+
+    // Read and validate a git file, returning trimmed contents if non-empty
+    let read_git_file = |segments: &[&str]| -> Option<String> {
+        let path = git_path(segments);
+        path.is_file()
+            .then(|| fs::read_to_string(&path).ok())?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    // Read a file and validate it contains a commit SHA
+    let read_git_commit_file = |segments: &[&str]| -> Option<String> {
+        let contents = read_git_file(segments)?;
+        let is_commit = Command::new("git")
+            .args(["cat-file", "-t", &contents])
+            .output()
+            .ok()
+            .map_or(false, |o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "commit"
+            });
+        is_commit.then_some(contents)
+    };
+
+    // Validate and parse a number from a string
+    let parse_number = |s: &str| -> Option<u64> { s.parse::<u64>().ok() };
+
+    // Check if a rebase-merge todo has actionable commits
+    let has_rebase_actions = |todo: &str| -> bool {
+        todo.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .any(|l| {
+                let cmd = l.split_whitespace().next().unwrap_or("");
+                COMMIT_ACTIONS.contains(&cmd)
+            })
+    };
+
+    // Determine operation type from sequencer todo (cherry-pick or revert)
+    let sequencer_operation = |todo: &str| -> Option<GitOperation> {
+        todo.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .find_map(|l| {
+                let token = l.split_whitespace().next().unwrap_or("");
+                match token {
+                    "pick" | "p" => Some(GitOperation::CherryPick),
+                    "revert" => Some(GitOperation::Revert),
+                    _ => None,
+                }
+            })
+    };
+
+    // Read and validate all git state files upfront
+    let applying = file_exists(&["rebase-apply", "applying"]);
+    let rebase_apply_next = read_git_file(&["rebase-apply", "next"]).and_then(|s| parse_number(&s));
+    let rebase_apply_last = read_git_file(&["rebase-apply", "last"]).and_then(|s| parse_number(&s));
+    let rebase_apply_onto = read_git_commit_file(&["rebase-apply", "onto"]);
+
+    let rebase_merge_has_actions = read_git_file(&["rebase-merge", "git-rebase-todo"])
+        .as_deref()
+        .map(has_rebase_actions)
+        .unwrap_or(false);
+    let rebase_merge_head_name = read_git_file(&["rebase-merge", "head-name"]);
+    let rebase_merge_onto = read_git_commit_file(&["rebase-merge", "onto"]);
+
+    let cherry_pick_head = read_git_commit_file(&["CHERRY_PICK_HEAD"]);
+    let revert_head = read_git_commit_file(&["REVERT_HEAD"]);
+    let merge_head = read_git_commit_file(&["MERGE_HEAD"]);
+    let bisect_head = read_git_commit_file(&["BISECT_HEAD"]);
+
+    let sequencer_op = read_git_file(&["sequencer", "todo"])
+        .as_deref()
+        .and_then(sequencer_operation);
+
+    // Decision logic based on validated state
+
+    // am: rebase-apply/applying is authoritative
+    if applying {
+        return Some(GitOperation::Am);
+    }
+
+    // rebase-merge backend (interactive/merge)
+    if rebase_merge_has_actions || (rebase_merge_head_name.is_some() && rebase_merge_onto.is_some())
+    {
+        return Some(GitOperation::Rebase);
+    }
+
+    // rebase-apply backend: validate counters and onto
+    if let (Some(next), Some(last), Some(_onto)) =
+        (rebase_apply_next, rebase_apply_last, rebase_apply_onto)
+    {
+        if (1..=last).contains(&next) {
+            return Some(GitOperation::Rebase);
+        }
+    }
+
+    // Check HEAD files for simple operations
+    if cherry_pick_head.is_some() {
+        return Some(GitOperation::CherryPick);
+    }
+    if revert_head.is_some() {
+        return Some(GitOperation::Revert);
+    }
+    if merge_head.is_some() {
+        return Some(GitOperation::Merge);
+    }
+
+    // Sequencer active but no HEAD files: inspect todo to determine operation
+    if let Some(op) = sequencer_op {
+        return Some(op);
+    }
+
+    if bisect_head.is_some() {
+        return Some(GitOperation::Bisect);
+    }
+
+    None
+}
+
+fn fetch_all_commits(merge_base_sha: &str, head_sha: &str) -> Vec<Commit> {
+    let output = git_output(&[
+        "--no-pager",
+        "log",
+        "--format=%H %s",
+        "--reverse",
+        "--topo-order",
+        &format!("{}..{}", merge_base_sha, head_sha),
+    ]);
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            if parts.len() != 2 {
+                return None;
+            }
+
+            let sha = parts[0].to_string();
+            let subject = parts[1].to_string();
+            let (commit_type, target_subject) = CommitType::parse_subject(&subject);
+            let target_subject = target_subject.map(|s| s.to_string());
+
+            Some(Commit {
+                sha,
+                subject,
+                commit_type,
+                target_subject,
+            })
+        })
+        .collect()
+}
+
+fn resolve_fixup_target(target_subject: &str, _commits: &[Commit]) -> String {
+    // Recursively resolve fixup chains: fixup! fixup! X -> X
+    let mut current = target_subject;
+    loop {
+        // Check if current target is itself a fixup/squash commit
+        let (commit_type, inner_target) = CommitType::parse_subject(current);
+        match commit_type {
+            CommitType::Fixup | CommitType::Squash => {
+                if let Some(inner) = inner_target {
+                    current = inner;
+                } else {
+                    break;
+                }
+            }
+            CommitType::Pick => break,
+        }
+    }
+    current.to_string()
+}
+
+fn validate_and_match_fixes(
+    commits: &[Commit],
+    merge_base_sha: &str,
+    head_sha: &str,
+) -> Vec<(usize, usize)> {
+    use std::collections::HashMap;
+
+    // First pass: build map of subject -> first index
+    let mut subject_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (idx, commit) in commits.iter().enumerate() {
+        subject_to_idx.entry(&commit.subject).or_insert(idx);
+    }
+
+    // Second pass: match fixes to targets
+    commits
+        .iter()
+        .enumerate()
+        .filter_map(|(fix_idx, commit)| {
+            // Skip non-fix commits
+            if commit.commit_type == CommitType::Pick {
+                return None;
+            }
+
+            let target_subject = commit.target_subject.as_ref()?;
+
+            // Resolve fixup chains: fixup! fixup! X -> X
+            let ultimate_target = resolve_fixup_target(target_subject, commits);
+
+            match subject_to_idx.get(ultimate_target.as_str()) {
+                Some(&target_idx) if target_idx < fix_idx => Some((target_idx, fix_idx)),
+                Some(&target_idx) => {
+                    eprintln!("✗ ERROR: fix commit comes before its target (invalid topology)");
+                    eprintln!(
+                        "CONTEXT: fix ({}) is before target ({})",
+                        commit.sha, commits[target_idx].sha
+                    );
+                    eprintln!("NEXT: This should not happen with proper fix commits. Check commit history.");
+                    exit(EXIT_DATAERR);
+                }
+                None => {
+                    eprintln!(
+                        "✗ ERROR: Cannot find target for fix subject: '{}'",
+                        target_subject
+                    );
+                    eprintln!(
+                        "CONTEXT: Fix commit {} has no matching target commit",
+                        commit.sha
+                    );
+                    eprintln!(
+                        "NEXT: List commits to find correct target: git --no-pager log --oneline --topo-order {}..{}",
+                        merge_base_sha, head_sha
+                    );
+                    eprintln!(
+                        "ALT: Drop this fix commit: GIT_SEQUENCE_EDITOR='sed -i.bak \"/^pick {}/ d\"' git rebase --interactive {}",
+                        &commit.sha[..7], merge_base_sha
+                    );
+                    exit(EXIT_DATAERR);
+                }
+            }
+        })
+        .collect()
+}
+
+fn build_todo_for_next_fix(commits: &[Commit], target_idx: usize, fix_idx: usize) -> String {
+    let mut todo = String::new();
+
+    for (i, commit) in commits.iter().enumerate() {
+        // Skip the fix commit in its original position
+        if i == fix_idx {
+            continue;
+        }
+
+        // Add the commit as a pick
+        todo.push_str(&format!("pick {} # {}\n", commit.sha, commit.subject));
+
+        // If this is the target, immediately add the fix after it
+        if i == target_idx {
+            let fix_commit = &commits[fix_idx];
+            todo.push_str(&format!(
+                "{} {} # {}\n",
+                fix_commit.commit_type, fix_commit.sha, fix_commit.subject
+            ));
+        }
+    }
+
+    todo
+}
+
+fn rebase_with_prebuilt_todo(
+    merge_base_sha: &str,
+    head_sha: &str,
+    todo_text: &str,
+    script_name: &str,
+    base_arg: &str,
+    head_arg: &str,
+    verbose: bool,
+    dry_run: bool,
+) {
+    if dry_run {
+        if verbose {
+            println!("→ [DRY RUN] Would rebase with todo:");
+            print!("{}", todo_text);
+        }
+        return;
+    }
+
+    let mut todo_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    todo_file
+        .write_all(todo_text.as_bytes())
+        .expect("Failed to write todo file");
+
+    let todo_tmp = todo_file.path();
+
+    if verbose {
+        println!("→ Starting interactive rebase with prebuilt todo");
+    }
+
+    // Overwrite the todo file with our prebuilt content via a tiny shell; safe quoting and portable.
+    let editor_cmd = format!(r#"sh -c 'cat -- "$0" > "$1"' "{}""#, todo_tmp.display());
+
+    let mut binding = Command::new("git");
+    let cmd = binding.env("GIT_SEQUENCE_EDITOR", &editor_cmd).args(&[
+        "rebase",
+        "--interactive",
+        "--no-autosquash",
+        "--rebase-merges",
+        merge_base_sha,
+    ]);
+
+    if verbose {
+        cmd.stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env_remove("GIT_EDITOR");
+    } else {
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("GIT_EDITOR", "true");
+    }
+
+    let status = cmd.status().expect("Failed to execute git rebase");
+
+    if !status.success() {
+        let rerun_cmd = build_rerun_command(script_name, base_arg, head_arg, verbose, dry_run);
+
+        eprintln!("✗ CONFLICTS: Resolve merge conflicts in the affected files");
+        eprintln!("NEXT: After resolving conflicts:");
+        eprintln!("  1. Stage resolved files: git add <file>...");
+        eprintln!("  2. Continue rebase: git rebase --continue");
+        eprintln!("  3. Re-run this script: {}", rerun_cmd);
+        eprintln!();
+        eprintln!("ALT: To abort this rebase: git rebase --abort");
+        exit(EXIT_TEMPFAIL);
+    }
+
+    let verify_status = Command::new("git")
+        .args(&["diff-tree", "--quiet", head_sha, "HEAD"])
+        .status()
+        .expect("Failed to execute git diff-tree");
+
+    if !verify_status.success() {
+        eprintln!("✗ ERROR: Rebase changed the total diff (unexpected behavior)");
+        eprintln!("DIAGNOSIS: Compare original vs current state:");
+        eprintln!("  git diff {} HEAD", head_sha);
+        eprintln!();
+        eprintln!("POSSIBLE CAUSES:");
+        eprintln!("  - Fixup applied to wrong commit");
+        eprintln!("  - Merge conflict resolution introduced changes");
+        eprintln!("  - Commit metadata differs (author, date, etc.)");
+        eprintln!();
+        eprintln!("TO RECOVER:");
+        eprintln!(
+            "  git reset --hard {}  # Rollback to known good state",
+            head_sha
+        );
+        exit(EXIT_SOFTWARE);
+    }
+
+    if verbose {
+        println!("✓ Rebase (one fix) completed successfully");
+    }
+}
+
+fn apply_next_fix(
+    state: BranchState,
+    script_name: &str,
+    base_arg: &str,
+    head_arg: &str,
+    verbose: bool,
+    dry_run: bool,
+) -> Option<BranchState> {
+    let fix_matches =
+        validate_and_match_fixes(&state.commits, &state.merge_base_sha, &state.head_sha);
+
+    if fix_matches.is_empty() {
+        return None;
+    }
+
+    let (target_idx, fix_idx) = fix_matches[0];
+    let target = &state.commits[target_idx];
+    let fix = &state.commits[fix_idx];
+
+    println!(
+        "→ Applying fix ({} remaining): {} {} → target {}",
+        fix_matches.len().saturating_sub(1),
+        fix.commit_type,
+        &fix.sha[..7],
+        &target.sha[..7]
+    );
+
+    if verbose {
+        println!("  Fix: {}", fix.subject);
+        println!("  Target: {}", target.subject);
+    }
+
+    let todo = build_todo_for_next_fix(&state.commits, target_idx, fix_idx);
+
+    if verbose {
+        println!(
+            "→ [{}] Would rebase with todo:",
+            if dry_run { "DRY RUN" } else { "EXECUTING" }
+        );
+        print!("{}", todo);
+    }
+
+    if dry_run {
+        // Simulate: remove the fixup commit from the list
+        let mut new_commits = state.commits.clone();
+        new_commits.remove(fix_idx);
+        Some(BranchState {
+            commits: new_commits,
+            merge_base_sha: state.merge_base_sha,
+            head_sha: state.head_sha,
+        })
+    } else {
+        // Real: execute rebase and re-fetch commits
+        rebase_with_prebuilt_todo(
+            &state.merge_base_sha,
+            &state.head_sha,
+            &todo,
+            script_name,
+            base_arg,
+            head_arg,
+            verbose,
+            dry_run,
+        );
+
+        let new_head_sha = resolve_commitish("HEAD");
+        let new_commits = fetch_all_commits(&state.merge_base_sha, &new_head_sha);
+
+        Some(BranchState {
+            commits: new_commits,
+            merge_base_sha: state.merge_base_sha,
+            head_sha: new_head_sha,
+        })
+    }
+}
+
+fn build_rerun_command(
+    script_name: &str,
+    base: &str,
+    head: &str,
+    verbose: bool,
+    dry_run: bool,
+) -> String {
+    let mut cmd = escape(script_name.into()).into_owned();
+
+    if !base.is_empty() {
+        cmd.push_str(" --base ");
+        cmd.push_str(&escape(base.into()).into_owned());
+    }
+
+    if head != "HEAD" {
+        cmd.push_str(" --head ");
+        cmd.push_str(&escape(head.into()).into_owned());
+    }
+
+    if verbose {
+        cmd.push_str(" --verbose");
+    }
+
+    if dry_run {
+        cmd.push_str(" --dry-run");
+    }
+
+    cmd
+}
