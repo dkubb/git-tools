@@ -2,7 +2,6 @@
 //! ```cargo
 //! [dependencies]
 //! clap = { version = "4.5.48", features = ["derive"] }
-//! regex = "1.10"
 //! ```
 //!
 //! Prune all merged local and remote branches
@@ -70,27 +69,30 @@ fn main() {
 }
 
 fn prune_remote_branches(branch: &str, remote: &str, default_branch: &str, dry_run: bool) {
+    // Use git branch --format for cleaner output
     let merged_branches = git_output(&[
         "branch",
         "--remotes",
         "--merged",
         &format!("{}/{}", remote, branch),
+        "--format=%(refname:short)",
     ]);
 
-    // Extract remote branch names (strip "  remote/" prefix)
-    let re = Regex::new(&format!(r"(?m)^  {}/(\S+)$", regex::escape(remote))).unwrap();
-    let branches: Vec<String> = re
-        .captures_iter(&merged_branches)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+    let prefix = format!("{}/", remote);
+    let branches: Vec<String> = merged_branches
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix).map(String::from))
         .collect();
 
-    // Filter out protected branches
-    let exclude_pattern = format!(r"^(release/|pr/|{}$|{}$)", default_branch, branch);
-    let exclude_re = Regex::new(&exclude_pattern).unwrap();
-
+    // Filter out protected branches using simpler pattern matching
     let to_delete: Vec<String> = branches
         .into_iter()
-        .filter(|b| !exclude_re.is_match(b))
+        .filter(|b| {
+            !b.starts_with("release/")
+                && !b.starts_with("pr/")
+                && b != default_branch
+                && b != branch
+        })
         .collect();
 
     if to_delete.is_empty() {
