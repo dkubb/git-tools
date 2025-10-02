@@ -1,24 +1,172 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! regex = "1.10"
+//! ```
+//!
+//! Prune all merged local and remote branches
 
-# Prune all merged local and remote branches
+use clap::Parser;
+use regex::Regex;
+use std::process::{Command, Stdio, exit};
 
-# shellcheck source=/dev/null
-source "${BASH_SOURCE%/*}/strict-mode.sh"
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-branch=$(git rev-parse --abbrev-ref HEAD)
-remote=$(git config -- "branch.${branch}.remote")
+#[derive(Parser, Debug)]
+#[command(name = "git-prune-all")]
+#[command(about = "Prune all merged local and remote branches", long_about = None)]
+struct Args {
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+}
 
-# Remove remote references
-git remote update --prune > /dev/null
+fn main() {
+    let args = Args::parse();
 
-# Remove remote branches
-git branch --remotes --merged "$remote/$branch" \
-  | perl -lne "print \$1 if m!(?<=^  $remote/)(\S+)\$!" \
-  | (grep --invert-match --extended-regexp "^(release/|pr/|$(git config init.defaultBranch)$|${branch}$)" || true) \
-  | xargs --no-run-if-empty git push --delete -- "$remote" || true
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
 
-# Remove local branches
-# shellcheck disable=SC2063
-git branch --merged "$branch" \
-  | grep --invert-match --fixed-strings --line-regexp "* $branch" \
-  | xargs --no-run-if-empty git branch --delete -- || true
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // Get remote for current branch
+    let remote = git_output(&["config", &format!("branch.{}.remote", branch)]);
+
+    // Remove remote references
+    println!("→ Updating remote references");
+    let _ = Command::new("git")
+        .args(&["remote", "update", "--prune"])
+        .stdout(Stdio::null())
+        .status();
+
+    // Get default branch
+    let default_branch = git_output(&["config", "init.defaultBranch"]);
+
+    // Remove remote branches
+    println!("→ Pruning merged remote branches");
+    prune_remote_branches(&branch, &remote, &default_branch, args.dry_run);
+
+    // Remove local branches
+    println!("→ Pruning merged local branches");
+    prune_local_branches(&branch, args.dry_run);
+
+    println!("✓ Pruning complete");
+    exit(EXIT_OK);
+}
+
+fn prune_remote_branches(branch: &str, remote: &str, default_branch: &str, dry_run: bool) {
+    let merged_branches = git_output(&[
+        "branch",
+        "--remotes",
+        "--merged",
+        &format!("{}/{}", remote, branch),
+    ]);
+
+    // Extract remote branch names (strip "  remote/" prefix)
+    let re = Regex::new(&format!(r"(?m)^  {}/(\S+)$", regex::escape(remote))).unwrap();
+    let branches: Vec<String> = re
+        .captures_iter(&merged_branches)
+        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .collect();
+
+    // Filter out protected branches
+    let exclude_pattern = format!(r"^(release/|pr/|{}$|{}$)", default_branch, branch);
+    let exclude_re = Regex::new(&exclude_pattern).unwrap();
+
+    let to_delete: Vec<String> = branches
+        .into_iter()
+        .filter(|b| !exclude_re.is_match(b))
+        .collect();
+
+    if to_delete.is_empty() {
+        println!("  No remote branches to prune");
+        return;
+    }
+
+    for branch_name in &to_delete {
+        if dry_run {
+            println!("  [DRY RUN] Would delete remote branch: {}", branch_name);
+        } else {
+            println!("  Deleting remote branch: {}", branch_name);
+        }
+    }
+
+    if !dry_run {
+        let mut cmd_args = vec!["push", "--delete", "--", remote];
+        let branch_refs: Vec<&str> = to_delete.iter().map(|s| s.as_str()).collect();
+        cmd_args.extend(branch_refs);
+
+        let _ = Command::new("git").args(&cmd_args).status();
+    }
+}
+
+fn prune_local_branches(branch: &str, dry_run: bool) {
+    let merged_branches = git_output(&["branch", "--merged", branch]);
+
+    // Filter out current branch (marked with *)
+    let current_marker = format!("* {}", branch);
+    let branches: Vec<String> = merged_branches
+        .lines()
+        .filter(|line| *line != current_marker)
+        .map(|line| line.trim().to_string())
+        .collect();
+
+    if branches.is_empty() {
+        println!("  No local branches to prune");
+        return;
+    }
+
+    for branch_name in &branches {
+        if dry_run {
+            println!("  [DRY RUN] Would delete local branch: {}", branch_name);
+        } else {
+            println!("  Deleting local branch: {}", branch_name);
+        }
+    }
+
+    if !dry_run {
+        let mut cmd_args = vec!["branch", "--delete", "--"];
+        let branch_refs: Vec<&str> = branches.iter().map(|s| s.as_str()).collect();
+        cmd_args.extend(branch_refs);
+
+        let _ = Command::new("git").args(&cmd_args).status();
+    }
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
