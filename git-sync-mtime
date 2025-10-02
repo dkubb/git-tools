@@ -1,13 +1,136 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! chrono = "0.4"
+//! filetime = "0.2"
+//! rayon = "1.10"
+//! ```
+//!
+//! Fix file mtime to match last git commit date
 
-# Fix file mtime to match last git commit date
+use chrono::DateTime;
+use clap::Parser;
+use filetime::{FileTime, set_file_mtime};
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::process::{Command, Stdio, exit};
 
-# shellcheck source=/dev/null
-source "${BASH_SOURCE%/*}/strict-mode.sh"
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-# shellcheck disable=SC2016
-git ls-tree -z -r --name-only HEAD | parallel --gnu --null --quote sh -c '
-  mtime=$(git log --date=iso -1 --format=%cd "{}");
-  touch --date "$mtime" "{}";
-  echo "$mtime - {}"
-'
+#[derive(Parser, Debug)]
+#[command(name = "git-sync-mtime")]
+#[command(about = "Fix file mtime to match last git commit date", long_about = None)]
+struct Args {
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get all file timestamps in a single git command for maximum performance
+    // This uses git log with --name-only to output all files with their commit timestamps
+    let log_output = git_output(&[
+        "log",
+        "--all",
+        "--pretty=format:%ct",
+        "--name-only",
+        "--diff-filter=AMCR",
+    ]);
+
+    // Parse the output into a HashMap of file -> timestamp (most recent)
+    let mut file_times: HashMap<String, i64> = HashMap::new();
+    let mut current_timestamp: Option<i64> = None;
+
+    for line in log_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Try to parse as timestamp first
+        if let Ok(ts) = trimmed.parse::<i64>() {
+            current_timestamp = Some(ts);
+        } else if let Some(ts) = current_timestamp {
+            // It's a filename - only add if we haven't seen it before (keeps most recent)
+            file_times.entry(trimmed.to_string()).or_insert(ts);
+        }
+    }
+
+    if file_times.is_empty() {
+        println!("✓ No files to sync");
+        exit(EXIT_OK);
+    }
+
+    println!("→ Syncing mtime for {} files", file_times.len());
+
+    // Process files in parallel for maximum performance
+    let entries: Vec<_> = file_times.into_iter().collect();
+    entries.par_iter().for_each(|(file, timestamp)| {
+        if args.dry_run {
+            if let Some(dt) = DateTime::from_timestamp(*timestamp, 0) {
+                println!(
+                    "  [DRY RUN] Would set {} - {}",
+                    dt.format("%Y-%m-%d %H:%M:%S"),
+                    file
+                );
+            }
+        } else {
+            let filetime = FileTime::from_unix_time(*timestamp, 0);
+            match set_file_mtime(file, filetime) {
+                Ok(_) => {
+                    if let Some(dt) = DateTime::from_timestamp(*timestamp, 0) {
+                        println!("  {} - {}", dt.format("%Y-%m-%d %H:%M:%S"), file);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ✗ Failed to update mtime for {}: {}", file, e);
+                }
+            }
+        }
+    });
+
+    println!("✓ Mtime sync complete");
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
