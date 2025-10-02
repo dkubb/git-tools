@@ -1,21 +1,196 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! thiserror = "2.0.17"
+//! ```
+//!
+//! Push a local branch to a newly created remote using push-each
 
-# Push a local branch to a newly created remote using push-each
+use clap::Parser;
+use std::process::{Command, Stdio, exit};
+use std::str::FromStr;
+use thiserror::Error;
 
-set -o errexit -o pipefail -o noglob -o noclobber -o nounset
-IFS=$'\n\t'
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-main() {
-  local -r remote=${1-origin} parent=${2-master}
-  local -r branch=$(git rev-parse --abbrev-ref HEAD)
+#[derive(Debug, Error)]
+enum ValidationError {
+    #[error("Git reference cannot be empty")]
+    GitRefEmpty,
 
-  echo "Pushing ${branch} to ${remote}/${branch} (parent=$parent)"
+    #[error("Failed to execute git rev-parse")]
+    GitRevParseFailed,
 
-  git fetch "$remote" "${parent}:${parent}"
-  git fix-branch "$parent"
-  git push "$remote" "${parent}:${branch}"
-  git branch --set-upstream-to "${remote}/${branch}"
-  git push-each "$parent"
+    #[error("Git reference not found: {ref_name}")]
+    GitRefNotFound { ref_name: String },
 }
 
-main "$@"
+#[derive(Debug, Clone)]
+struct GitRef(String);
+
+impl FromStr for GitRef {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ValidationError::GitRefEmpty);
+        }
+
+        // Validate that the ref exists using git rev-parse
+        let output = Command::new("git")
+            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
+            .output()
+            .map_err(|_| ValidationError::GitRevParseFailed)?;
+
+        if !output.status.success() {
+            return Err(ValidationError::GitRefNotFound {
+                ref_name: s.to_string(),
+            });
+        }
+
+        // Store the resolved SHA
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(GitRef(sha))
+    }
+}
+
+impl GitRef {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "git-push-branch")]
+#[command(about = "Push a local branch to a newly created remote using push-each", long_about = None)]
+struct Args {
+    /// Remote to push to
+    #[arg(default_value = "origin")]
+    remote: String,
+
+    /// Parent branch
+    #[arg(default_value = "master")]
+    parent: GitRef,
+
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    if args.dry_run {
+        println!(
+            "[DRY RUN] Would push {} to {}/{} (parent={})",
+            branch,
+            args.remote,
+            branch,
+            args.parent.as_str()
+        );
+        println!("[DRY RUN] Would fetch {}", args.parent.as_str());
+        println!("[DRY RUN] Would fix branch {}", args.parent.as_str());
+        println!("[DRY RUN] Would push {}:{}", args.parent.as_str(), branch);
+        println!("[DRY RUN] Would set upstream to {}/{}", args.remote, branch);
+        println!("[DRY RUN] Would push each commit");
+        println!("✓ [DRY RUN] Branch would be pushed successfully");
+        exit(EXIT_OK);
+    }
+
+    println!(
+        "Pushing {} to {}/{} (parent={})",
+        branch,
+        args.remote,
+        branch,
+        args.parent.as_str()
+    );
+
+    // Fetch parent
+    git_run(&[
+        "fetch",
+        &args.remote,
+        &format!("{}:{}", args.parent.as_str(), args.parent.as_str()),
+    ]);
+
+    // Fix parent branch
+    git_run(&["fix-branch", args.parent.as_str()]);
+
+    // Push parent to remote branch
+    git_run(&[
+        "push",
+        &args.remote,
+        &format!("{}:{}", args.parent.as_str(), branch),
+    ]);
+
+    // Set upstream
+    git_run(&[
+        "branch",
+        "--set-upstream-to",
+        &format!("{}/{}", args.remote, branch),
+    ]);
+
+    // Push each commit
+    git_run(&["push-each", args.parent.as_str()]);
+
+    println!("✓ Branch pushed successfully");
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_run(args: &[&str]) {
+    let status = match Command::new("git").args(args).status() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        exit(EXIT_SOFTWARE);
+    }
+}
