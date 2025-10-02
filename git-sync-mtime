@@ -11,10 +11,10 @@
 
 use chrono::DateTime;
 use clap::Parser;
-use filetime::{set_file_mtime, FileTime};
+use filetime::{FileTime, set_file_mtime};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::process::{exit, Command, Stdio};
+use std::process::{Command, Stdio, exit};
 
 const EXIT_OK: i32 = 0;
 const EXIT_DATAERR: i32 = 65; // bad input / not found
