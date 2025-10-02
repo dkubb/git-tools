@@ -11,7 +11,7 @@
 use clap::Parser;
 use shell_escape::escape;
 use std::io::Write;
-use std::process::{exit, Command, Stdio};
+use std::process::{Command, Stdio, exit};
 
 const EXIT_OK: i32 = 0;
 const EXIT_DATAERR: i32 = 65; // bad input / not found
@@ -468,7 +468,8 @@ fn fetch_all_commits(merge_base_sha: &str, head_sha: &str) -> Vec<Commit> {
 
             // Check if this is a revert commit and set appropriate type
             let (final_commit_type, reverted_commit) = if CommitType::is_revert_commit(&subject) {
-                let reverted_commit = CommitType::extract_reverted_commit(&subject).map(|s| s.to_string());
+                let reverted_commit =
+                    CommitType::extract_reverted_commit(&subject).map(|s| s.to_string());
                 (CommitType::Revert, reverted_commit)
             } else {
                 (commit_type, None)
@@ -507,8 +508,14 @@ fn resolve_fixup_target(target_subject: &str, _commits: &[Commit]) -> String {
 
 #[derive(Debug, Clone, PartialEq)]
 enum FixMatch {
-    Fixup { target_idx: usize, fix_idx: usize },
-    RevertPair { commit_idx: usize, revert_idx: usize },
+    Fixup {
+        target_idx: usize,
+        fix_idx: usize,
+    },
+    RevertPair {
+        commit_idx: usize,
+        revert_idx: usize,
+    },
 }
 
 fn validate_and_match_fixes(
@@ -543,7 +550,10 @@ fn validate_and_match_fixes(
 
         match subject_to_idx.get(ultimate_target.as_str()) {
             Some(&target_idx) if target_idx < fix_idx => {
-                matches.push(FixMatch::Fixup { target_idx, fix_idx });
+                matches.push(FixMatch::Fixup {
+                    target_idx,
+                    fix_idx,
+                });
             }
             Some(&target_idx) => {
                 eprintln!("✗ ERROR: fix commit comes before its target (invalid topology)");
@@ -551,7 +561,9 @@ fn validate_and_match_fixes(
                     "CONTEXT: fix ({}) is before target ({})",
                     commit.sha, commits[target_idx].sha
                 );
-                eprintln!("NEXT: This should not happen with proper fix commits. Check commit history.");
+                eprintln!(
+                    "NEXT: This should not happen with proper fix commits. Check commit history."
+                );
                 exit(EXIT_DATAERR);
             }
             None => {
@@ -569,7 +581,8 @@ fn validate_and_match_fixes(
                 );
                 eprintln!(
                     "ALT: Drop this fix commit: GIT_SEQUENCE_EDITOR='sed -i.bak \"/^pick {}/ d\"' git rebase --interactive {}",
-                    &commit.sha[..7], merge_base_sha
+                    &commit.sha[..7],
+                    merge_base_sha
                 );
                 exit(EXIT_DATAERR);
             }
@@ -587,7 +600,10 @@ fn validate_and_match_fixes(
         // Find the original commit that matches the revert
         if let Some(&commit_idx) = subject_to_idx.get(reverted_subject.as_str()) {
             if commit_idx < revert_idx {
-                matches.push(FixMatch::RevertPair { commit_idx, revert_idx });
+                matches.push(FixMatch::RevertPair {
+                    commit_idx,
+                    revert_idx,
+                });
             }
         }
     }
@@ -599,7 +615,10 @@ fn build_todo_for_next_match(commits: &[Commit], match_result: &FixMatch) -> Str
     let mut todo = String::new();
 
     match match_result {
-        FixMatch::Fixup { target_idx, fix_idx } => {
+        FixMatch::Fixup {
+            target_idx,
+            fix_idx,
+        } => {
             for (i, commit) in commits.iter().enumerate() {
                 // Skip the fix commit in its original position
                 if i == *fix_idx {
@@ -619,7 +638,10 @@ fn build_todo_for_next_match(commits: &[Commit], match_result: &FixMatch) -> Str
                 }
             }
         }
-        FixMatch::RevertPair { commit_idx, revert_idx } => {
+        FixMatch::RevertPair {
+            commit_idx,
+            revert_idx,
+        } => {
             // For revert pairs, explicitly drop both commits
             for (i, commit) in commits.iter().enumerate() {
                 if i == *commit_idx || i == *revert_idx {
@@ -771,18 +793,31 @@ fn apply_next_fix(
     let match_result = &fix_matches[0];
 
     let (_target_idx, _fix_idx, action_description) = match match_result {
-        FixMatch::Fixup { target_idx, fix_idx } => {
+        FixMatch::Fixup {
+            target_idx,
+            fix_idx,
+        } => {
             let target = &state.commits[*target_idx];
             let fix = &state.commits[*fix_idx];
-            let description = format!("{} {} → target {}",
-                fix.commit_type, &fix.sha[..7], &target.sha[..7]);
+            let description = format!(
+                "{} {} → target {}",
+                fix.commit_type,
+                &fix.sha[..7],
+                &target.sha[..7]
+            );
             (*target_idx, *fix_idx, description)
         }
-        FixMatch::RevertPair { commit_idx, revert_idx } => {
+        FixMatch::RevertPair {
+            commit_idx,
+            revert_idx,
+        } => {
             let commit = &state.commits[*commit_idx];
             let revert = &state.commits[*revert_idx];
-            let description = format!("revert {} + commit {} (both will be dropped)",
-                &revert.sha[..7], &commit.sha[..7]);
+            let description = format!(
+                "revert {} + commit {} (both will be dropped)",
+                &revert.sha[..7],
+                &commit.sha[..7]
+            );
             (*commit_idx, *revert_idx, description)
         }
     };
@@ -795,13 +830,19 @@ fn apply_next_fix(
 
     if verbose {
         match match_result {
-            FixMatch::Fixup { target_idx, fix_idx } => {
+            FixMatch::Fixup {
+                target_idx,
+                fix_idx,
+            } => {
                 let target = &state.commits[*target_idx];
                 let fix = &state.commits[*fix_idx];
                 println!("  Fix: {}", fix.subject);
                 println!("  Target: {}", target.subject);
             }
-            FixMatch::RevertPair { commit_idx, revert_idx } => {
+            FixMatch::RevertPair {
+                commit_idx,
+                revert_idx,
+            } => {
                 let commit = &state.commits[*commit_idx];
                 let revert = &state.commits[*revert_idx];
                 println!("  Commit: {}", commit.subject);
@@ -827,8 +868,14 @@ fn apply_next_fix(
 
         // Remove commits in reverse order to maintain correct indices
         let mut indices_to_remove: Vec<usize> = match match_result {
-            FixMatch::Fixup { target_idx: _, fix_idx } => vec![*fix_idx],
-            FixMatch::RevertPair { commit_idx, revert_idx } => vec![*commit_idx, *revert_idx],
+            FixMatch::Fixup {
+                target_idx: _,
+                fix_idx,
+            } => vec![*fix_idx],
+            FixMatch::RevertPair {
+                commit_idx,
+                revert_idx,
+            } => vec![*commit_idx, *revert_idx],
         };
         indices_to_remove.sort_unstable_by(|a, b| b.cmp(a)); // Sort in descending order
 
