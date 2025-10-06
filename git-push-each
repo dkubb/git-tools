@@ -30,9 +30,6 @@ remote=$(git config -- "branch.${branch}.remote")
 # Commits in the local branch not in upstream
 commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
 
-# TODO: use git push --force on the first commit, and then --ff-only all others
-# TODO: allow --set-upstream to be passed-through
-
 # Push all commits not upstream
 first_commit=true
 for commit in $commits
