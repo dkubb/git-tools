@@ -181,14 +181,16 @@ fn main() {
     }
 
     let base = if base_arg.is_empty() {
-        let base_branch = git_output(&[
+        let base_branch = git_output_optional(&[
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             "origin/HEAD",
         ]);
 
-        if base_branch.is_empty() {
+        if let Some(branch) = base_branch {
+            branch
+        } else {
             let example_cmd =
                 build_rerun_command(&script_name, "origin/main", &head_arg, verbose, dry_run);
             eprintln!("✗ ERROR: Cannot determine default branch from origin/HEAD");
@@ -197,7 +199,6 @@ fn main() {
             eprintln!("  {}", example_cmd);
             exit(EXIT_DATAERR);
         }
-        base_branch
     } else {
         base_arg
     };
@@ -271,6 +272,16 @@ fn git_output(args: &[&str]) -> String {
     }
 
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn resolve_commitish(ref_name: &str) -> String {
