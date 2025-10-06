@@ -6,9 +6,14 @@
 source "${BASH_SOURCE%/*}/strict-mode.sh"
 
 # Parse arguments
+set_upstream=""
 parent=""
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --set-upstream)
+      set_upstream="--set-upstream"
+      shift
+      ;;
     *)
       if [[ -z "$parent" ]]; then
         parent="$1"
@@ -34,10 +39,10 @@ for commit in $commits
 do
   if [ "$first_commit" = true ]; then
     # Push first commit with force to establish the branch
-    git push --force-with-lease -- "$remote" "$commit:$branch"
+    git push "$set_upstream" --force-with-lease -- "$remote" "$commit:$branch"
     first_commit=false
   else
     # Push subsequent commits with fast-forward only
-    git push --force-with-lease --ff-only -- "$remote" "$commit:$branch"
+    git push "$set_upstream" --force-with-lease --ff-only -- "$remote" "$commit:$branch"
   fi
 done
