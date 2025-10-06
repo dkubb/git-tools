@@ -16,8 +16,15 @@ commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
 # TODO: allow --set-upstream to be passed-through
 
 # Push all commits not upstream
+first_commit=true
 for commit in $commits
 do
-  # Trigger CI for each commit by pushing them individually
-  git push --force-with-lease -- "$remote" "$commit:$branch"
+  if [ "$first_commit" = true ]; then
+    # Push first commit with force to establish the branch
+    git push --force-with-lease -- "$remote" "$commit:$branch"
+    first_commit=false
+  else
+    # Push subsequent commits with fast-forward only
+    git push --force-with-lease --ff-only -- "$remote" "$commit:$branch"
+  fi
 done
