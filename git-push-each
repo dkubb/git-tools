@@ -5,7 +5,20 @@
 # shellcheck source=/dev/null
 source "${BASH_SOURCE%/*}/strict-mode.sh"
 
-parent=${1-$(git config init.defaultBranch)}
+# Parse arguments
+parent=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    *)
+      if [[ -z "$parent" ]]; then
+        parent="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+parent=${parent-$(git config init.defaultBranch)}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
