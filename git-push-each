@@ -142,6 +142,7 @@ fn main() {
             cmd.arg("--set-upstream");
         }
 
+        cmd.arg("--atomic");
         cmd.arg("--force-with-lease");
         cmd.arg("--")
             .arg(&remote)
