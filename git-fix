@@ -4,6 +4,7 @@
 //! clap = { version = "4.5.48", features = ["derive"] }
 //! shell-escape = "0.1.5"
 //! tempfile = "3.2.3"
+//! thiserror = "2.0.17"
 //! ```
 //!
 //! Automatically apply fixup! and squash! commits to their targets
@@ -12,23 +13,72 @@ use clap::Parser;
 use shell_escape::escape;
 use std::io::Write;
 use std::process::{Command, Stdio, exit};
+use std::str::FromStr;
+use thiserror::Error;
 
 const EXIT_OK: i32 = 0;
 const EXIT_DATAERR: i32 = 65; // bad input / not found
 const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 const EXIT_TEMPFAIL: i32 = 75; // conflicts / retryable
 
+#[derive(Debug, Error)]
+enum ValidationError {
+    #[error("Git reference cannot be empty")]
+    GitRefEmpty,
+
+    #[error("Failed to execute git rev-parse")]
+    GitRevParseFailed,
+
+    #[error("Git reference not found: {ref_name}")]
+    GitRefNotFound { ref_name: String },
+}
+
+#[derive(Debug, Clone)]
+struct GitRef(String);
+
+impl FromStr for GitRef {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ValidationError::GitRefEmpty);
+        }
+
+        // Validate that the ref exists using git rev-parse
+        let output = Command::new("git")
+            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
+            .output()
+            .map_err(|_| ValidationError::GitRevParseFailed)?;
+
+        if !output.status.success() {
+            return Err(ValidationError::GitRefNotFound {
+                ref_name: s.to_string(),
+            });
+        }
+
+        // Store the resolved SHA
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(GitRef(sha))
+    }
+}
+
+impl GitRef {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "git-fix")]
 #[command(about = "Automatically apply fixup! and squash! commits to their targets", long_about = None)]
 struct Args {
     /// Base branch or commit to compare against
-    #[arg(long, default_value = "")]
-    base: String,
+    #[arg(long)]
+    base: Option<GitRef>,
 
     /// Head commit to process fixes from
     #[arg(long, default_value = "HEAD")]
-    head: String,
+    head: GitRef,
 
     /// Show verbose output
     #[arg(long, short)]
@@ -162,13 +212,19 @@ fn main() {
         })
         .unwrap_or_else(|| "git-fix".to_string());
 
-    let base_arg = args.base;
-    let head_arg = args.head;
+    let base_ref = args.base;
+    let head_ref = args.head;
     let verbose = args.verbose;
     let dry_run = args.dry_run;
 
     if let Some(op) = git_operation() {
-        let rerun_cmd = build_rerun_command(&script_name, &base_arg, &head_arg, verbose, dry_run);
+        let rerun_cmd = build_rerun_command(
+            &script_name,
+            base_ref.as_ref().map(|r| r.as_str()),
+            head_ref.as_str(),
+            verbose,
+            dry_run,
+        );
         eprintln!("✗ IN-PROGRESS OPERATION: A {} is currently active.", op);
         eprintln!(
             "NEXT: Finish or abort the {} before running: {}",
@@ -180,7 +236,9 @@ fn main() {
         exit(EXIT_TEMPFAIL);
     }
 
-    let base = if base_arg.is_empty() {
+    let base_ref = if let Some(base) = base_ref {
+        base
+    } else {
         let base_branch = git_output_optional(&[
             "rev-parse",
             "--abbrev-ref",
@@ -189,23 +247,32 @@ fn main() {
         ]);
 
         if let Some(branch) = base_branch {
-            branch
+            match GitRef::from_str(&branch) {
+                Ok(git_ref) => git_ref,
+                Err(e) => {
+                    eprintln!("✗ ERROR: {}", e);
+                    exit(EXIT_DATAERR);
+                }
+            }
         } else {
-            let example_cmd =
-                build_rerun_command(&script_name, "origin/main", &head_arg, verbose, dry_run);
+            let example_cmd = build_rerun_command(
+                &script_name,
+                Some("origin/main"),
+                head_ref.as_str(),
+                verbose,
+                dry_run,
+            );
             eprintln!("✗ ERROR: Cannot determine default branch from origin/HEAD");
             eprintln!("NEXT: Set origin/HEAD with: git remote set-head origin --auto");
             eprintln!("OR specify base explicitly with --base flag, e.g.:");
             eprintln!("  {}", example_cmd);
             exit(EXIT_DATAERR);
         }
-    } else {
-        base_arg
     };
 
-    let head_sha = resolve_commitish(&head_arg);
-    let base_sha = resolve_commitish(&base);
-    let merge_base_sha = git_output(&["merge-base", &head_sha, &base_sha]);
+    let head_sha = head_ref.as_str().to_string();
+    let base_sha = base_ref.as_str();
+    let merge_base_sha = git_output(&["merge-base", &head_sha, base_sha]);
 
     // Initialize state
     let commits = fetch_all_commits(&merge_base_sha, &head_sha);
@@ -234,9 +301,14 @@ fn main() {
     let mut fixes_applied = 0;
 
     // Functional loop: apply fixes one at a time
-    while let Some(new_state) =
-        apply_next_fix(state, &script_name, &base, &head_arg, verbose, dry_run)
-    {
+    while let Some(new_state) = apply_next_fix(
+        state,
+        &script_name,
+        base_ref.as_str(),
+        head_ref.as_str(),
+        verbose,
+        dry_run,
+    ) {
         state = new_state;
         fixes_applied += 1;
     }
@@ -282,10 +354,6 @@ fn git_output_optional(args: &[&str]) -> Option<String> {
     }
 
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn resolve_commitish(ref_name: &str) -> String {
-    git_output(&["rev-parse", "--verify", &format!("{}^{{commit}}", ref_name)])
 }
 
 /// Detects the current in-progress Git operation using state files under $GIT_DIR.
@@ -663,7 +731,7 @@ fn rebase_with_prebuilt_todo(
     head_sha: &str,
     todo_text: &str,
     script_name: &str,
-    base_arg: &str,
+    base_arg: Option<&str>,
     head_arg: &str,
     verbose: bool,
     dry_run: bool,
@@ -895,13 +963,14 @@ fn apply_next_fix(
             &state.head_sha,
             &todo,
             script_name,
-            base_arg,
+            Some(base_arg),
             head_arg,
             verbose,
             dry_run,
         );
 
-        let new_head_sha = resolve_commitish("HEAD");
+        let new_head = GitRef::from_str("HEAD").expect("Failed to resolve HEAD");
+        let new_head_sha = new_head.as_str().to_string();
         let new_commits = fetch_all_commits(&state.merge_base_sha, &new_head_sha);
 
         Some(BranchState {
@@ -914,16 +983,16 @@ fn apply_next_fix(
 
 fn build_rerun_command(
     script_name: &str,
-    base: &str,
+    base: Option<&str>,
     head: &str,
     verbose: bool,
     dry_run: bool,
 ) -> String {
     let mut cmd = escape(script_name.into()).into_owned();
 
-    if !base.is_empty() {
+    if let Some(base_str) = base {
         cmd.push_str(" --base ");
-        cmd.push_str(&escape(base.into()).into_owned());
+        cmd.push_str(&escape(base_str.into()).into_owned());
     }
 
     if head != "HEAD" {
