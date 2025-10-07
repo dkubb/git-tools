@@ -1,23 +1,141 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! ```
+//!
+//! Fix branch commit data to be the same as author data
 
-# Fix branch commit data to be the same as author data
+use clap::Parser;
+use std::process::{exit, Command, Stdio};
 
-# shellcheck source=/dev/null
-source "${BASH_SOURCE%/*}/strict-mode.sh"
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-export FILTER_BRANCH_SQUELCH_WARNING=1
+#[derive(Parser, Debug)]
+#[command(name = "git-fix-branch")]
+#[command(about = "Fix branch commit data to be the same as author data", long_about = None)]
+struct Args {
+    /// Parent branch to rebase on
+    #[arg(default_value = "")]
+    parent: String,
 
-parent=${1-$(git config init.defaultBranch)}
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+}
 
-# The command to execute for each commit
-read -r -d '' command <<-'COMMAND' || true
+fn main() {
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get parent branch - use default if not provided
+    let parent = if args.parent.is_empty() {
+        git_output(&["config", "init.defaultBranch"])
+    } else {
+        args.parent
+    };
+
+    if args.dry_run {
+        println!("→ [DRY RUN] Would rebase on {}", parent);
+        println!("→ [DRY RUN] Would fix committer data to match author data");
+        println!("✓ [DRY RUN] Branch would be fixed successfully");
+        exit(EXIT_OK);
+    }
+
+    // Rebase the current branch on top of the parent
+    println!("→ Rebasing on {}", parent);
+    git_run(&["rebase", "--rebase-merges", "--", &parent]);
+
+    // Rewrite all commits to use the author data
+    println!("→ Fixing committer data to match author data");
+
+    let env_filter = r#"
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
 export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
-COMMAND
+"#;
 
-# Rebase the current branch on top of the parent
-git rebase --rebase-merges -- "$parent"
+    let range = format!("{}..HEAD", parent);
 
-# Rewrite all commits to use the author data
-git filter-branch --force --env-filter "$command" -- "$parent..HEAD"
+    let status = Command::new("git")
+        .args(&[
+            "filter-branch",
+            "--force",
+            "--env-filter",
+            env_filter,
+            "--",
+            &range,
+        ])
+        .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("✓ Branch fixed successfully");
+            exit(EXIT_OK);
+        }
+        Ok(_) => {
+            eprintln!("✗ ERROR: git filter-branch failed");
+            exit(EXIT_SOFTWARE);
+        }
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git filter-branch");
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    }
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_run(args: &[&str]) {
+    let status = match Command::new("git").args(args).status() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        exit(EXIT_SOFTWARE);
+    }
+}
