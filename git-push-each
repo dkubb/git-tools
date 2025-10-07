@@ -1,45 +1,135 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! ```
+//!
+//! Push commits individually to trigger CI builds for each
 
-# Push commits individually to trigger CI builds for each
+use clap::Parser;
+use std::process::{exit, Command, Stdio};
 
-# shellcheck source=/dev/null
-source "${BASH_SOURCE%/*}/strict-mode.sh"
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-# Parse arguments
-set_upstream=""
-parent=""
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --set-upstream)
-      set_upstream="--set-upstream"
-      shift
-      ;;
-    *)
-      if [[ -z "$parent" ]]; then
-        parent="$1"
-      fi
-      shift
-      ;;
-  esac
-done
+#[derive(Parser, Debug)]
+#[command(name = "git-push-each")]
+#[command(about = "Push commits individually to trigger CI builds for each", long_about = None)]
+struct Args {
+    /// Set upstream for the branch
+    #[arg(long)]
+    set_upstream: bool,
 
-parent=${parent-$(git config init.defaultBranch)}
-branch=$(git rev-parse --abbrev-ref HEAD)
-remote=$(git config -- "branch.${branch}.remote")
+    /// Parent branch
+    #[arg(default_value = "")]
+    parent: String,
+}
 
-# Commits in the local branch not in upstream
-commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
+fn main() {
+    let args = Args::parse();
 
-# Push all commits not upstream
-first_commit=true
-for commit in $commits
-do
-  if [ "$first_commit" = true ]; then
-    # Push first commit with force to establish the branch
-    git push "$set_upstream" --force-with-lease -- "$remote" "$commit:$branch"
-    first_commit=false
-  else
-    # Push subsequent commits with fast-forward only
-    git push "$set_upstream" --force-with-lease --ff-only -- "$remote" "$commit:$branch"
-  fi
-done
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get parent branch - use default if not provided
+    let parent = if args.parent.is_empty() {
+        git_output(&["config", "init.defaultBranch"])
+    } else {
+        args.parent
+    };
+
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // Get remote for current branch
+    let remote = git_output(&["config", &format!("branch.{}.remote", branch)]);
+
+    // Get commits in the local branch not in upstream
+    let commits_output = git_output(&[
+        "rev-list",
+        "HEAD",
+        &format!("^{}/{}", remote, branch),
+        &format!("^{}/{}", remote, parent),
+        "--reverse",
+    ]);
+
+    let commits: Vec<&str> = commits_output.lines().collect();
+
+    if commits.is_empty() {
+        println!("✓ No commits to push");
+        exit(EXIT_OK);
+    }
+
+    println!("→ Pushing {} commits individually", commits.len());
+
+    // Push all commits not upstream
+    for (i, commit) in commits.iter().enumerate() {
+        println!("  [{}/{}] Pushing {}", i + 1, commits.len(), commit);
+
+        let mut cmd = Command::new("git");
+        cmd.arg("push");
+
+        // Add --set-upstream only on first commit if requested
+        if i == 0 && args.set_upstream {
+            cmd.arg("--set-upstream");
+        }
+
+        cmd.arg("--force-with-lease");
+        cmd.arg("--")
+            .arg(&remote)
+            .arg(&format!("{}:{}", commit, branch));
+
+        let status = cmd.status();
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => {
+                eprintln!("✗ ERROR: Failed to push commit {}", commit);
+                exit(EXIT_SOFTWARE);
+            }
+            Err(e) => {
+                eprintln!("✗ ERROR: Failed to execute git push");
+                eprintln!("DETAILS: {}", e);
+                exit(EXIT_SOFTWARE);
+            }
+        }
+    }
+
+    println!("✓ All commits pushed successfully");
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
