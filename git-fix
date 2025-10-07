@@ -48,6 +48,7 @@ enum CommitType {
     Fixup,
     Squash,
     Pick,
+    Revert,
 }
 
 impl CommitType {
@@ -60,6 +61,21 @@ impl CommitType {
         }
         (CommitType::Pick, None)
     }
+
+    fn is_revert_commit(subject: &str) -> bool {
+        subject.starts_with("Revert ")
+    }
+
+    fn extract_reverted_commit(subject: &str) -> Option<&str> {
+        // Git revert commits follow the pattern: "Revert \"<original commit message>\""
+        // This extracts the original commit message from the quotes
+        if let Some(start) = subject.strip_prefix("Revert \"") {
+            if let Some(end) = start.strip_suffix("\"") {
+                return Some(end);
+            }
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for CommitType {
@@ -68,6 +84,7 @@ impl std::fmt::Display for CommitType {
             CommitType::Fixup => f.write_str("fixup"),
             CommitType::Squash => f.write_str("squash"),
             CommitType::Pick => f.write_str("pick"),
+            CommitType::Revert => f.write_str("revert"),
         }
     }
 }
@@ -78,6 +95,7 @@ struct Commit {
     subject: String,
     commit_type: CommitType,
     target_subject: Option<String>,
+    reverted_commit: Option<String>,
 }
 
 struct BranchState {
@@ -163,14 +181,16 @@ fn main() {
     }
 
     let base = if base_arg.is_empty() {
-        let base_branch = git_output(&[
+        let base_branch = git_output_optional(&[
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             "origin/HEAD",
         ]);
 
-        if base_branch.is_empty() {
+        if let Some(branch) = base_branch {
+            branch
+        } else {
             let example_cmd =
                 build_rerun_command(&script_name, "origin/main", &head_arg, verbose, dry_run);
             eprintln!("✗ ERROR: Cannot determine default branch from origin/HEAD");
@@ -179,7 +199,6 @@ fn main() {
             eprintln!("  {}", example_cmd);
             exit(EXIT_DATAERR);
         }
-        base_branch
     } else {
         base_arg
     };
@@ -253,6 +272,16 @@ fn git_output(args: &[&str]) -> String {
     }
 
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn resolve_commitish(ref_name: &str) -> String {
@@ -437,11 +466,20 @@ fn fetch_all_commits(merge_base_sha: &str, head_sha: &str) -> Vec<Commit> {
             let (commit_type, target_subject) = CommitType::parse_subject(&subject);
             let target_subject = target_subject.map(|s| s.to_string());
 
+            // Check if this is a revert commit and set appropriate type
+            let (final_commit_type, reverted_commit) = if CommitType::is_revert_commit(&subject) {
+                let reverted_commit = CommitType::extract_reverted_commit(&subject).map(|s| s.to_string());
+                (CommitType::Revert, reverted_commit)
+            } else {
+                (commit_type, None)
+            };
+
             Some(Commit {
                 sha,
                 subject,
-                commit_type,
+                commit_type: final_commit_type,
                 target_subject,
+                reverted_commit,
             })
         })
         .collect()
@@ -461,17 +499,23 @@ fn resolve_fixup_target(target_subject: &str, _commits: &[Commit]) -> String {
                     break;
                 }
             }
-            CommitType::Pick => break,
+            CommitType::Pick | CommitType::Revert => break,
         }
     }
     current.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum FixMatch {
+    Fixup { target_idx: usize, fix_idx: usize },
+    RevertPair { commit_idx: usize, revert_idx: usize },
 }
 
 fn validate_and_match_fixes(
     commits: &[Commit],
     merge_base_sha: &str,
     head_sha: &str,
-) -> Vec<(usize, usize)> {
+) -> Vec<FixMatch> {
     use std::collections::HashMap;
 
     // First pass: build map of subject -> first index
@@ -480,75 +524,112 @@ fn validate_and_match_fixes(
         subject_to_idx.entry(&commit.subject).or_insert(idx);
     }
 
-    // Second pass: match fixes to targets
-    commits
-        .iter()
-        .enumerate()
-        .filter_map(|(fix_idx, commit)| {
-            // Skip non-fix commits
-            if commit.commit_type == CommitType::Pick {
-                return None;
-            }
+    let mut matches = Vec::new();
 
-            let target_subject = commit.target_subject.as_ref()?;
-
-            // Resolve fixup chains: fixup! fixup! X -> X
-            let ultimate_target = resolve_fixup_target(target_subject, commits);
-
-            match subject_to_idx.get(ultimate_target.as_str()) {
-                Some(&target_idx) if target_idx < fix_idx => Some((target_idx, fix_idx)),
-                Some(&target_idx) => {
-                    eprintln!("✗ ERROR: fix commit comes before its target (invalid topology)");
-                    eprintln!(
-                        "CONTEXT: fix ({}) is before target ({})",
-                        commit.sha, commits[target_idx].sha
-                    );
-                    eprintln!("NEXT: This should not happen with proper fix commits. Check commit history.");
-                    exit(EXIT_DATAERR);
-                }
-                None => {
-                    eprintln!(
-                        "✗ ERROR: Cannot find target for fix subject: '{}'",
-                        target_subject
-                    );
-                    eprintln!(
-                        "CONTEXT: Fix commit {} has no matching target commit",
-                        commit.sha
-                    );
-                    eprintln!(
-                        "NEXT: List commits to find correct target: git --no-pager log --oneline --topo-order {}..{}",
-                        merge_base_sha, head_sha
-                    );
-                    eprintln!(
-                        "ALT: Drop this fix commit: GIT_SEQUENCE_EDITOR='sed -i.bak \"/^pick {}/ d\"' git rebase --interactive {}",
-                        &commit.sha[..7], merge_base_sha
-                    );
-                    exit(EXIT_DATAERR);
-                }
-            }
-        })
-        .collect()
-}
-
-fn build_todo_for_next_fix(commits: &[Commit], target_idx: usize, fix_idx: usize) -> String {
-    let mut todo = String::new();
-
-    for (i, commit) in commits.iter().enumerate() {
-        // Skip the fix commit in its original position
-        if i == fix_idx {
+    // Second pass: match fixups to targets
+    for (fix_idx, commit) in commits.iter().enumerate() {
+        // Skip non-fix commits for fixup matching
+        if commit.commit_type == CommitType::Pick {
             continue;
         }
 
-        // Add the commit as a pick
-        todo.push_str(&format!("pick {} # {}\n", commit.sha, commit.subject));
+        let target_subject = match commit.target_subject.as_ref() {
+            Some(subject) => subject,
+            None => continue,
+        };
 
-        // If this is the target, immediately add the fix after it
-        if i == target_idx {
-            let fix_commit = &commits[fix_idx];
-            todo.push_str(&format!(
-                "{} {} # {}\n",
-                fix_commit.commit_type, fix_commit.sha, fix_commit.subject
-            ));
+        // Resolve fixup chains: fixup! fixup! X -> X
+        let ultimate_target = resolve_fixup_target(target_subject, commits);
+
+        match subject_to_idx.get(ultimate_target.as_str()) {
+            Some(&target_idx) if target_idx < fix_idx => {
+                matches.push(FixMatch::Fixup { target_idx, fix_idx });
+            }
+            Some(&target_idx) => {
+                eprintln!("✗ ERROR: fix commit comes before its target (invalid topology)");
+                eprintln!(
+                    "CONTEXT: fix ({}) is before target ({})",
+                    commit.sha, commits[target_idx].sha
+                );
+                eprintln!("NEXT: This should not happen with proper fix commits. Check commit history.");
+                exit(EXIT_DATAERR);
+            }
+            None => {
+                eprintln!(
+                    "✗ ERROR: Cannot find target for fix subject: '{}'",
+                    target_subject
+                );
+                eprintln!(
+                    "CONTEXT: Fix commit {} has no matching target commit",
+                    commit.sha
+                );
+                eprintln!(
+                    "NEXT: List commits to find correct target: git --no-pager log --oneline --topo-order {}..{}",
+                    merge_base_sha, head_sha
+                );
+                eprintln!(
+                    "ALT: Drop this fix commit: GIT_SEQUENCE_EDITOR='sed -i.bak \"/^pick {}/ d\"' git rebase --interactive {}",
+                    &commit.sha[..7], merge_base_sha
+                );
+                exit(EXIT_DATAERR);
+            }
+        }
+    }
+
+    // Third pass: find revert pairs
+    // We simply drop both commits and let git rebase handle any conflicts
+    for (revert_idx, revert_commit) in commits.iter().enumerate() {
+        let reverted_subject = match &revert_commit.reverted_commit {
+            Some(subject) => subject,
+            None => continue,
+        };
+
+        // Find the original commit that matches the revert
+        if let Some(&commit_idx) = subject_to_idx.get(reverted_subject.as_str()) {
+            if commit_idx < revert_idx {
+                matches.push(FixMatch::RevertPair { commit_idx, revert_idx });
+            }
+        }
+    }
+
+    matches
+}
+
+fn build_todo_for_next_match(commits: &[Commit], match_result: &FixMatch) -> String {
+    let mut todo = String::new();
+
+    match match_result {
+        FixMatch::Fixup { target_idx, fix_idx } => {
+            for (i, commit) in commits.iter().enumerate() {
+                // Skip the fix commit in its original position
+                if i == *fix_idx {
+                    continue;
+                }
+
+                // Add the commit as a pick
+                todo.push_str(&format!("pick {} # {}\n", commit.sha, commit.subject));
+
+                // If this is the target, immediately add the fix after it
+                if i == *target_idx {
+                    let fix_commit = &commits[*fix_idx];
+                    todo.push_str(&format!(
+                        "{} {} # {}\n",
+                        fix_commit.commit_type, fix_commit.sha, fix_commit.subject
+                    ));
+                }
+            }
+        }
+        FixMatch::RevertPair { commit_idx, revert_idx } => {
+            // For revert pairs, explicitly drop both commits
+            for (i, commit) in commits.iter().enumerate() {
+                if i == *commit_idx || i == *revert_idx {
+                    // Use drop to make intent explicit
+                    todo.push_str(&format!("drop {} # {}\n", commit.sha, commit.subject));
+                } else {
+                    // Add the commit as a pick
+                    todo.push_str(&format!("pick {} # {}\n", commit.sha, commit.subject));
+                }
+            }
         }
     }
 
@@ -569,6 +650,29 @@ fn rebase_with_prebuilt_todo(
         if verbose {
             println!("→ [DRY RUN] Would rebase with todo:");
             print!("{}", todo_text);
+        }
+        return;
+    }
+
+    // Handle empty todo (all commits removed)
+    if todo_text.trim().is_empty() {
+        if verbose {
+            println!("→ Empty todo detected - all commits will be removed");
+            println!("→ Resetting to merge base: {}", merge_base_sha);
+        }
+
+        let status = Command::new("git")
+            .args(&["reset", "--hard", merge_base_sha])
+            .status()
+            .expect("Failed to execute git reset");
+
+        if !status.success() {
+            eprintln!("✗ ERROR: Failed to reset to merge base");
+            exit(EXIT_SOFTWARE);
+        }
+
+        if verbose {
+            println!("✓ Successfully removed all commits");
         }
         return;
     }
@@ -664,24 +768,50 @@ fn apply_next_fix(
         return None;
     }
 
-    let (target_idx, fix_idx) = fix_matches[0];
-    let target = &state.commits[target_idx];
-    let fix = &state.commits[fix_idx];
+    let match_result = &fix_matches[0];
+
+    let (_target_idx, _fix_idx, action_description) = match match_result {
+        FixMatch::Fixup { target_idx, fix_idx } => {
+            let target = &state.commits[*target_idx];
+            let fix = &state.commits[*fix_idx];
+            let description = format!("{} {} → target {}",
+                fix.commit_type, &fix.sha[..7], &target.sha[..7]);
+            (*target_idx, *fix_idx, description)
+        }
+        FixMatch::RevertPair { commit_idx, revert_idx } => {
+            let commit = &state.commits[*commit_idx];
+            let revert = &state.commits[*revert_idx];
+            let description = format!("revert {} + commit {} (both will be dropped)",
+                &revert.sha[..7], &commit.sha[..7]);
+            (*commit_idx, *revert_idx, description)
+        }
+    };
 
     println!(
-        "→ Applying fix ({} remaining): {} {} → target {}",
+        "→ Applying fix ({} remaining): {}",
         fix_matches.len().saturating_sub(1),
-        fix.commit_type,
-        &fix.sha[..7],
-        &target.sha[..7]
+        action_description
     );
 
     if verbose {
-        println!("  Fix: {}", fix.subject);
-        println!("  Target: {}", target.subject);
+        match match_result {
+            FixMatch::Fixup { target_idx, fix_idx } => {
+                let target = &state.commits[*target_idx];
+                let fix = &state.commits[*fix_idx];
+                println!("  Fix: {}", fix.subject);
+                println!("  Target: {}", target.subject);
+            }
+            FixMatch::RevertPair { commit_idx, revert_idx } => {
+                let commit = &state.commits[*commit_idx];
+                let revert = &state.commits[*revert_idx];
+                println!("  Commit: {}", commit.subject);
+                println!("  Revert: {}", revert.subject);
+                println!("  Both will be dropped from history");
+            }
+        }
     }
 
-    let todo = build_todo_for_next_fix(&state.commits, target_idx, fix_idx);
+    let todo = build_todo_for_next_match(&state.commits, match_result);
 
     if verbose {
         println!(
@@ -692,9 +822,20 @@ fn apply_next_fix(
     }
 
     if dry_run {
-        // Simulate: remove the fixup commit from the list
+        // Simulate: remove the appropriate commits from the list
         let mut new_commits = state.commits.clone();
-        new_commits.remove(fix_idx);
+
+        // Remove commits in reverse order to maintain correct indices
+        let mut indices_to_remove: Vec<usize> = match match_result {
+            FixMatch::Fixup { target_idx: _, fix_idx } => vec![*fix_idx],
+            FixMatch::RevertPair { commit_idx, revert_idx } => vec![*commit_idx, *revert_idx],
+        };
+        indices_to_remove.sort_unstable_by(|a, b| b.cmp(a)); // Sort in descending order
+
+        for idx in indices_to_remove {
+            new_commits.remove(idx);
+        }
+
         Some(BranchState {
             commits: new_commits,
             merge_base_sha: state.merge_base_sha,

@@ -5,19 +5,41 @@
 # shellcheck source=/dev/null
 source "${BASH_SOURCE%/*}/strict-mode.sh"
 
-parent=${1-$(git config init.defaultBranch)}
+# Parse arguments
+set_upstream=""
+parent=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --set-upstream)
+      set_upstream="--set-upstream"
+      shift
+      ;;
+    *)
+      if [[ -z "$parent" ]]; then
+        parent="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+parent=${parent-$(git config init.defaultBranch)}
 branch=$(git rev-parse --abbrev-ref HEAD)
 remote=$(git config -- "branch.${branch}.remote")
 
 # Commits in the local branch not in upstream
 commits=$(git rev-list HEAD "^$remote/$branch" "^$remote/$parent" --reverse)
 
-# TODO: use git push --force on the first commit, and then --ff-only all others
-# TODO: allow --set-upstream to be passed-through
-
 # Push all commits not upstream
+first_commit=true
 for commit in $commits
 do
-  # Trigger CI for each commit by pushing them individually
-  git push --force-with-lease -- "$remote" "$commit:$branch"
+  if [ "$first_commit" = true ]; then
+    # Push first commit with force to establish the branch
+    git push "$set_upstream" --force-with-lease -- "$remote" "$commit:$branch"
+    first_commit=false
+  else
+    # Push subsequent commits with fast-forward only
+    git push "$set_upstream" --force-with-lease --ff-only -- "$remote" "$commit:$branch"
+  fi
 done
