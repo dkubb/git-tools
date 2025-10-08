@@ -1,0 +1,538 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! thiserror = "2.0.17"
+//! ```
+//!
+//! Work with git diff hunks - show minimal diffs and stage specific hunks
+
+use clap::{Parser, Subcommand};
+use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio, exit};
+use std::str::FromStr;
+use thiserror::Error;
+
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
+
+/// Build git diff command arguments with consistent algorithm
+fn build_diff_args(file: Option<&str>) -> Vec<&str> {
+    let mut args = vec!["diff", "--diff-algorithm", "histogram"];
+    if let Some(f) = file {
+        args.push(f);
+    }
+    args
+}
+
+#[derive(Debug, Error)]
+enum ValidationError {
+    #[error("File path cannot be empty")]
+    FilePathEmpty,
+
+    #[error("File path should be relative to repository root")]
+    FilePathAbsolute,
+
+    #[error("Not inside a git repository")]
+    NotGitRepository,
+
+    #[error("File '{path}' is outside the git repository")]
+    FileOutsideRepo { path: String },
+
+    #[error("File '{path}' is not tracked by git")]
+    FileNotTracked { path: String },
+
+    #[error("Range cannot be empty")]
+    RangeEmpty,
+
+    #[error("Invalid range format (expected: -start,count or -start)")]
+    RangeInvalidFormat,
+
+    #[error("Start line '{start}' must be a positive number")]
+    RangeStartInvalid { start: String },
+
+    #[error("Line count '{count}' must be a positive number")]
+    RangeCountInvalid { count: String },
+
+    #[error("Start line must be greater than 0 (line numbers start at 1)")]
+    RangeStartZero,
+
+    #[error("Failed to execute git command")]
+    GitCommandFailed,
+}
+
+#[derive(Debug, Clone)]
+struct Range {
+    start: usize,
+    count: usize,
+}
+
+impl Range {
+    fn parse(s: &str) -> Result<Self, ValidationError> {
+        if s.is_empty() {
+            return Err(ValidationError::RangeEmpty);
+        }
+
+        let parts: Vec<&str> = s.split(',').collect();
+
+        if parts.is_empty() || parts.len() > 2 {
+            return Err(ValidationError::RangeInvalidFormat);
+        }
+
+        let start: usize = parts[0]
+            .parse()
+            .map_err(|_| ValidationError::RangeStartInvalid {
+                start: parts[0].to_string(),
+            })?;
+
+        let count: usize = if parts.len() == 2 {
+            parts[1]
+                .parse()
+                .map_err(|_| ValidationError::RangeCountInvalid {
+                    count: parts[1].to_string(),
+                })?
+        } else {
+            1 // Default to 1 if not specified (git does this for single-line changes)
+        };
+
+        if start == 0 {
+            return Err(ValidationError::RangeStartZero);
+        }
+
+        // Note: count can be 0 for pure insertions/deletions in git diff -U0
+        // e.g., @@ -2,0 +3 @@ means insert at line 3 with no deletion
+        Ok(Range { start, count })
+    }
+}
+
+impl FromStr for Range {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Range::parse(s)
+    }
+}
+
+/// A Range with a prefix character for display purposes
+#[derive(Debug, Clone)]
+struct PrefixedRange<const PREFIX: char>(Range);
+
+impl<const PREFIX: char> FromStr for PrefixedRange<PREFIX> {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Range::parse(s).map(PrefixedRange)
+    }
+}
+
+impl<const PREFIX: char> fmt::Display for PrefixedRange<PREFIX> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.count == 1 {
+            write!(f, "{}{}", PREFIX, self.0.start)
+        } else {
+            write!(f, "{}{},{}", PREFIX, self.0.start, self.0.count)
+        }
+    }
+}
+
+type OldRange = PrefixedRange<'-'>;
+type NewRange = PrefixedRange<'+'>;
+
+#[derive(Debug, Clone)]
+struct TrackedFile(PathBuf);
+
+impl TrackedFile {
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl FromStr for TrackedFile {
+    type Err = ValidationError;
+
+    fn from_str(path_str: &str) -> Result<Self, Self::Err> {
+        let path = Path::new(path_str);
+
+        // Check for obviously invalid paths
+        if path_str.is_empty() {
+            return Err(ValidationError::FilePathEmpty);
+        }
+
+        // Validate it's not an absolute path
+        if path.is_absolute() {
+            return Err(ValidationError::FilePathAbsolute);
+        }
+
+        let path_buf = path.to_path_buf();
+
+        // Check if we're in a git repository
+        let git_root = Command::new("git")
+            .args(&["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|_| ValidationError::NotGitRepository)?;
+
+        if !git_root.status.success() {
+            return Err(ValidationError::NotGitRepository);
+        }
+
+        let repo_root = String::from_utf8_lossy(&git_root.stdout).trim().to_string();
+        let repo_path = Path::new(&repo_root);
+
+        // Get current working directory
+        let cwd = std::env::current_dir().map_err(|_| ValidationError::GitCommandFailed)?;
+
+        // Resolve the full path
+        let full_path = cwd.join(&path_buf);
+
+        // Check if the resolved path is inside the repository
+        if !full_path.starts_with(repo_path) {
+            return Err(ValidationError::FileOutsideRepo {
+                path: path_str.to_string(),
+            });
+        }
+
+        // Check if file is tracked by git
+        let tracked_check = Command::new("git")
+            .args(&["ls-files", "--error-unmatch", path_str])
+            .output()
+            .map_err(|_| ValidationError::GitCommandFailed)?;
+
+        if !tracked_check.status.success() {
+            return Err(ValidationError::FileNotTracked {
+                path: path_str.to_string(),
+            });
+        }
+
+        Ok(TrackedFile(path_buf))
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "git-hunk")]
+#[command(about = "Work with git diff hunks", long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Show diff with minimal context (zero lines) for precise hunk identification
+    Diff {
+        /// File path to show diff for (optional)
+        file: Option<TrackedFile>,
+
+        /// Show verbose output
+        #[arg(long, short)]
+        verbose: bool,
+    },
+    /// Add a specific hunk to the staging area without interactive mode
+    Add {
+        /// File path (relative to repository root)
+        #[arg(long)]
+        file: TrackedFile,
+
+        /// Old range from diff (e.g., 12,4)
+        #[arg(long)]
+        old: OldRange,
+
+        /// New range from diff (e.g., 12,6)
+        #[arg(long)]
+        new: NewRange,
+
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show verbose output
+        #[arg(long, short)]
+        verbose: bool,
+    },
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    match args.command {
+        Commands::Diff { file, verbose } => {
+            show_minimal_diff(file.as_ref().map(|f| f.as_path()), verbose);
+        }
+        Commands::Add {
+            file,
+            old,
+            new,
+            dry_run,
+            verbose,
+        } => {
+            stage_hunk(file.as_path(), &old, &new, dry_run, verbose);
+        }
+    }
+
+    exit(EXIT_OK);
+}
+
+fn show_minimal_diff(file: Option<&Path>, verbose: bool) {
+    let mut args = vec!["--no-pager"];
+    let file_str = file.map(|p| p.to_string_lossy());
+    args.extend(build_diff_args(file_str.as_deref()));
+
+    if verbose {
+        eprintln!("→ Running: git {}", args.join(" "));
+    }
+
+    let output = Command::new("git")
+        .args(&args)
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("✗ ERROR: Failed to execute git diff");
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        });
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git diff failed");
+        exit(EXIT_SOFTWARE);
+    }
+
+    let diff = String::from_utf8_lossy(&output.stdout);
+    annotate_diff_with_commands(&diff, file);
+}
+
+fn annotate_diff_with_commands(diff: &str, file: Option<&Path>) {
+    let mut current_file = file.map(|p| p.to_string_lossy().to_string());
+
+    for line in diff.lines() {
+        // Track the current file from diff headers
+        if line.starts_with("+++ b/") {
+            if let Some(filename) = line.strip_prefix("+++ b/") {
+                current_file = Some(filename.to_string());
+            }
+        }
+
+        // Check if this is a hunk header line
+        if line.starts_with("@@") {
+            if let Some((old_range, new_range, _rest)) = parse_hunk_header(line) {
+                // Use the current file if available
+                if let Some(ref file_arg) = current_file {
+                    // Print the command comment before the @@ line
+                    println!(
+                        "# git hunk add --file {} --old {} --new {}",
+                        file_arg, old_range, new_range
+                    );
+                }
+            }
+        }
+        println!("{}", line);
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<(String, String, String)> {
+    // Parse "@@ -old_start,old_count +new_start,new_count @@ rest"
+    let line = line.strip_prefix("@@")?;
+    let (ranges, rest) = line.split_once("@@")?;
+
+    let parts: Vec<&str> = ranges.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let old_range = parts[0].strip_prefix('-')?.to_string();
+    let new_range = parts[1].strip_prefix('+')?.to_string();
+
+    Some((old_range, new_range, rest.to_string()))
+}
+
+fn stage_hunk(
+    file_path: &Path,
+    old_range: &OldRange,
+    new_range: &NewRange,
+    dry_run: bool,
+    verbose: bool,
+) {
+    let file_str = file_path.to_string_lossy();
+
+    // Get current diff for this specific file
+    let diff_args = build_diff_args(Some(file_str.as_ref()));
+    let output = Command::new("git")
+        .args(&diff_args)
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("✗ ERROR: Failed to execute git diff");
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        });
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git diff failed for {}", file_str);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    let diff = String::from_utf8_lossy(&output.stdout);
+
+    if diff.trim().is_empty() {
+        eprintln!("✗ ERROR: No changes found in {}", file_str);
+        eprintln!("NEXT: Make changes to the file or check git status");
+        exit(EXIT_DATAERR);
+    }
+
+    // Find the matching hunk
+    let hunk_marker = format!("@@ {} {} @@", old_range, new_range);
+
+    if verbose {
+        println!("→ Looking for hunk: {}", hunk_marker);
+    }
+
+    let patch = extract_hunk(&diff, &hunk_marker);
+
+    match patch {
+        Some(p) => {
+            if dry_run {
+                println!(
+                    "[DRY RUN] Would stage hunk: {} {} {}",
+                    file_str, old_range, new_range
+                );
+                if verbose {
+                    println!("→ Patch content:");
+                    println!("{}", p);
+                }
+                return;
+            }
+
+            // Apply the patch
+            let mut child = Command::new("git")
+                .args(&["apply", "--cached"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| {
+                    eprintln!("✗ ERROR: Failed to execute git apply");
+                    eprintln!("DETAILS: {}", e);
+                    exit(EXIT_SOFTWARE);
+                });
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(p.as_bytes()).unwrap_or_else(|e| {
+                    eprintln!("✗ ERROR: Failed to write patch to git apply");
+                    eprintln!("DETAILS: {}", e);
+                    exit(EXIT_SOFTWARE);
+                });
+            }
+
+            let status = child.wait().unwrap_or_else(|e| {
+                eprintln!("✗ ERROR: Failed to wait for git apply");
+                eprintln!("DETAILS: {}", e);
+                exit(EXIT_SOFTWARE);
+            });
+
+            if status.success() {
+                println!("✓ Staged hunk: {} {} {}", file_str, old_range, new_range);
+            } else {
+                eprintln!("✗ ERROR: Failed to apply hunk");
+                eprintln!("DETAILS: The working directory may have changed");
+                eprintln!("NEXT: Verify changes with: git diff {}", file_str);
+                exit(EXIT_SOFTWARE);
+            }
+        }
+        None => {
+            eprintln!(
+                "✗ ERROR: Could not find hunk with ranges {} {} in {}",
+                old_range, new_range, file_str
+            );
+            eprintln!(
+                "TIP: Rerun `git hunk diff {}` to refresh hunk offsets before retrying.",
+                file_str
+            );
+            eprintln!();
+            eprintln!("Available hunks in {}:", file_str);
+            show_available_hunks(&diff);
+            eprintln!();
+            eprintln!("NEXT: Copy ranges exactly from git diff output");
+            exit(EXIT_DATAERR);
+        }
+    }
+}
+
+fn extract_hunk(diff: &str, hunk_marker: &str) -> Option<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+
+    // Find the file header
+    let mut file_start = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("diff --git") {
+            file_start = Some(i);
+            break;
+        }
+    }
+
+    let file_start = file_start?;
+
+    // Find the hunk header
+    let mut hunk_start = None;
+    for (i, line) in lines.iter().enumerate().skip(file_start) {
+        if line.starts_with(hunk_marker) {
+            hunk_start = Some(i);
+            break;
+        }
+        // Stop if we hit another file
+        if i > file_start && line.starts_with("diff --git") {
+            break;
+        }
+    }
+
+    let hunk_start = hunk_start?;
+
+    // Find the end of this hunk (next @@ or next file or EOF)
+    let mut hunk_end = hunk_start + 1;
+    while hunk_end < lines.len() {
+        if lines[hunk_end].starts_with("@@") || lines[hunk_end].starts_with("diff --git") {
+            break;
+        }
+        hunk_end += 1;
+    }
+
+    // Build the complete patch
+    let mut patch_lines = Vec::new();
+
+    // Add file headers (everything from file start to first @@)
+    for i in file_start..hunk_start {
+        patch_lines.push(lines[i]);
+    }
+
+    // Add the hunk
+    for i in hunk_start..hunk_end {
+        patch_lines.push(lines[i]);
+    }
+
+    let mut patch = patch_lines.join("\n");
+    patch.push('\n');
+    Some(patch)
+}
+
+fn show_available_hunks(diff: &str) {
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            println!("  {}", line);
+        }
+    }
+}
