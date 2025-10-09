@@ -1,0 +1,2 @@
+# Mark all git-* scripts as Rust for language detection
+git-* linguist-language=Rust
