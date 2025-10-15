@@ -1,0 +1,252 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! thiserror = "2.0.17"
+//! ```
+//!
+//! Reword a commit message using git replace
+
+use clap::Parser;
+use std::process::{Command, Stdio, exit};
+use std::str::FromStr;
+use thiserror::Error;
+
+const EXIT_OK: i32 = 0;
+const EXIT_USAGE: i32 = 64; // command line usage error
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
+
+#[derive(Debug, Error)]
+enum ValidationError {
+    #[error("Git reference cannot be empty")]
+    GitRefEmpty,
+
+    #[error("Failed to execute git rev-parse")]
+    GitRevParseFailed,
+
+    #[error("Git reference not found: {ref_name}")]
+    GitRefNotFound { ref_name: String },
+
+    #[error("Failed to run git-new-from: {details}")]
+    NewFromFailed { details: String },
+
+    #[error("Failed to create new commit: {details}")]
+    NewCommitFailed { details: String },
+
+    #[error("git-new-from returned empty commit hash")]
+    EmptyCommitHash,
+
+    #[error("Failed to run git replace: {details}")]
+    GitReplaceFailed { details: String },
+
+    #[error("Failed to replace commit: {details}")]
+    ReplaceCommitFailed { details: String },
+}
+
+#[derive(Debug, Clone)]
+struct GitRef(String);
+
+impl FromStr for GitRef {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ValidationError::GitRefEmpty);
+        }
+
+        // Validate that the ref exists using git rev-parse
+        let output = Command::new("git")
+            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
+            .output()
+            .map_err(|_| ValidationError::GitRevParseFailed)?;
+
+        if !output.status.success() {
+            return Err(ValidationError::GitRefNotFound {
+                ref_name: s.to_string(),
+            });
+        }
+
+        // Store the resolved SHA
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(GitRef(sha))
+    }
+}
+
+impl GitRef {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "git-reword-commit")]
+#[command(about = "Reword a commit message using git replace", long_about = None)]
+struct Args {
+    /// Commit ID or reference to reword
+    commit_id: GitRef,
+
+    /// New commit message
+    #[arg(long, short)]
+    message: Option<String>,
+
+    /// Read new commit message from file
+    #[arg(long, short = 'F')]
+    file: Option<String>,
+
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Show verbose output
+    #[arg(long, short)]
+    verbose: bool,
+}
+
+fn main() {
+    // Handle --help in raw args before clap parsing
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        Args::parse_from(&["git-reword-commit", "--help"]);
+        return;
+    }
+
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    if args.message.is_none() && args.file.is_none() {
+        eprintln!("✗ ERROR: Missing required message option");
+        eprintln!("NEXT: Use --message <msg> or --file <path>");
+        exit(EXIT_USAGE);
+    }
+
+    if args.message.is_some() && args.file.is_some() {
+        eprintln!("✗ ERROR: Cannot specify both --message and --file");
+        eprintln!("NEXT: Use either --message or --file, not both");
+        exit(EXIT_USAGE);
+    }
+
+    // GitRef is already validated and resolved to SHA
+    if args.verbose {
+        println!("→ Rewording commit {}", &args.commit_id.as_str()[..7]);
+    }
+
+    if args.dry_run {
+        println!(
+            "[DRY RUN] Would reword commit {}",
+            &args.commit_id.as_str()[..7]
+        );
+        if let Some(msg) = &args.message {
+            println!(
+                "[DRY RUN] New message: {}",
+                msg.lines().next().unwrap_or("")
+            );
+        } else if let Some(f) = &args.file {
+            println!("[DRY RUN] New message from file: {}", f);
+        }
+        println!("✓ [DRY RUN] Would successfully reword commit");
+        exit(EXIT_OK);
+    }
+
+    // Get the path to git-new-from in the current directory
+    let git_new_from = std::env::current_dir()
+        .expect("Failed to get current directory")
+        .join("git-new-from");
+
+    // Build args for git-new-from
+    let mut new_from_args = vec![args.commit_id.as_str().to_string()];
+
+    if let Some(msg) = args.message {
+        new_from_args.push("--message".to_string());
+        new_from_args.push(msg);
+    } else if let Some(f) = args.file {
+        new_from_args.push("--file".to_string());
+        new_from_args.push(f);
+    }
+
+    let new_commit = match create_replacement_commit(&git_new_from, &new_from_args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ ERROR: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if let Err(e) = replace_commit(&args.commit_id, &new_commit) {
+        eprintln!("✗ ERROR: {}", e);
+        exit(EXIT_SOFTWARE);
+    }
+
+    if args.verbose {
+        println!(
+            "✓ Replaced {} with {}",
+            &args.commit_id.as_str()[..7],
+            &new_commit[..7]
+        );
+    } else {
+        println!(
+            "Replaced {} with {}",
+            &args.commit_id.as_str()[..7],
+            &new_commit[..7]
+        );
+    }
+
+    exit(EXIT_OK);
+}
+
+fn create_replacement_commit(
+    git_new_from: &std::path::Path,
+    args: &[String],
+) -> Result<String, ValidationError> {
+    let output = Command::new(git_new_from)
+        .args(args)
+        .output()
+        .map_err(|e| ValidationError::NewFromFailed {
+            details: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        return Err(ValidationError::NewCommitFailed {
+            details: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+
+    // git-new-from outputs just the commit SHA
+    let commit_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if commit_id.is_empty() {
+        return Err(ValidationError::EmptyCommitHash);
+    }
+
+    Ok(commit_id)
+}
+
+fn replace_commit(old_commit: &GitRef, new_commit: &str) -> Result<(), ValidationError> {
+    let output = Command::new("git")
+        .args(&["replace", old_commit.as_str(), new_commit])
+        .output()
+        .map_err(|e| ValidationError::GitReplaceFailed {
+            details: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        return Err(ValidationError::ReplaceCommitFailed {
+            details: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+
+    Ok(())
+}
