@@ -58,7 +58,7 @@ impl FromStr for GitRef {
 }
 
 impl GitRef {
-    fn as_str(&self) -> &str {
+    fn sha(&self) -> &str {
         &self.0
     }
 }
@@ -92,34 +92,59 @@ fn main() {
         exit(EXIT_DATAERR);
     }
 
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // Get remote for current branch
+    let remote = git_output_optional(&["config", &format!("branch.{}.remote", branch)])
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "origin".to_string());
+
+    let upstream_branch = git_output_optional(&["config", &format!("branch.{}.merge", branch)])
+        .and_then(|r| r.strip_prefix("refs/heads/").map(|s| s.to_string()))
+        .unwrap_or_else(|| branch.clone());
+
+    let remote_branch_ref = format!("{}/{}", remote, upstream_branch);
+    let remote_branch_exists = git_ref_exists(&remote_branch_ref);
+
     // Get parent branch - use default if not provided
     let parent = if let Some(p) = args.parent {
         p
     } else {
-        let default_branch = git_output(&["config", "init.defaultBranch"]);
-        match GitRef::from_str(&default_branch) {
-            Ok(git_ref) => git_ref,
-            Err(e) => {
-                eprintln!("✗ ERROR: {}", e);
+        match resolve_default_branch(&remote) {
+            Ok(default_branch) => match GitRef::from_str(&default_branch) {
+                Ok(git_ref) => git_ref,
+                Err(e) => {
+                    eprintln!("✗ ERROR: {}", e);
+                    eprintln!(
+                        "NEXT: Provide --parent <branch> or fix the default branch configuration"
+                    );
+                    exit(EXIT_DATAERR);
+                }
+            },
+            Err(message) => {
+                eprintln!("✗ ERROR: {}", message);
+                eprintln!("NEXT: Provide --parent <branch> or configure init.defaultBranch");
                 exit(EXIT_DATAERR);
             }
         }
     };
 
-    // Get current branch
-    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
-
-    // Get remote for current branch
-    let remote = git_output(&["config", &format!("branch.{}.remote", branch)]);
-
     // Get commits in the local branch not in upstream
-    let commits_output = git_output(&[
-        "rev-list",
-        "HEAD",
-        &format!("^{}/{}", remote, branch),
-        &format!("^{}/{}", remote, parent.as_str()),
-        "--reverse",
-    ]);
+    let mut rev_args: Vec<String> = vec![
+        "rev-list".into(),
+        "HEAD".into(),
+        format!("^{}", parent.sha()),
+    ];
+
+    if remote_branch_exists {
+        rev_args.push(format!("^{}", remote_branch_ref));
+    }
+
+    rev_args.push("--reverse".into());
+
+    let rev_args_refs: Vec<&str> = rev_args.iter().map(|s| s.as_str()).collect();
+    let commits_output = git_output(&rev_args_refs);
 
     let commits: Vec<&str> = commits_output.lines().collect();
 
@@ -168,6 +193,16 @@ fn main() {
     exit(EXIT_OK);
 }
 
+fn git_ref_exists(ref_name: &str) -> bool {
+    Command::new("git")
+        .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", ref_name)])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn git_output(args: &[&str]) -> String {
     let output = match Command::new("git").args(args).output() {
         Ok(output) => output,
@@ -189,4 +224,55 @@ fn git_output(args: &[&str]) -> String {
     }
 
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_default_branch(remote: &str) -> Result<String, String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Ok(value);
+    }
+
+    let remote_head = format!("refs/remotes/{}/HEAD", remote);
+    if let Some(symbolic) = git_output_optional(&["symbolic-ref", "--quiet", &remote_head]) {
+        let prefix = format!("refs/remotes/{}/", remote);
+        let trimmed = symbolic
+            .strip_prefix(&prefix)
+            .map(|s| s.to_string())
+            .unwrap_or(symbolic);
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(format!(
+        "Unable to determine default branch (checked init.defaultBranch, {}, and common fallbacks)",
+        remote_head
+    ))
 }

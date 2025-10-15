@@ -29,7 +29,10 @@ enum ValidationError {
 }
 
 #[derive(Debug, Clone)]
-struct GitRef(String);
+struct GitRef {
+    raw: String,
+    sha: String,
+}
 
 impl FromStr for GitRef {
     type Err = ValidationError;
@@ -53,13 +56,20 @@ impl FromStr for GitRef {
 
         // Store the resolved SHA
         let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(GitRef(sha))
+        Ok(GitRef {
+            raw: s.to_string(),
+            sha,
+        })
     }
 }
 
 impl GitRef {
-    fn as_str(&self) -> &str {
-        &self.0
+    fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    fn sha(&self) -> &str {
+        &self.sha
     }
 }
 
@@ -72,8 +82,7 @@ struct Args {
     remote: String,
 
     /// Parent branch
-    #[arg(default_value = "master")]
-    parent: GitRef,
+    parent: Option<GitRef>,
 
     /// Show what would be done without making changes
     #[arg(long)]
@@ -100,18 +109,45 @@ fn main() {
     // Get current branch
     let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
 
+    let parent_ref = if let Some(provided) = args.parent.clone() {
+        provided
+    } else {
+        match resolve_default_branch(&args.remote) {
+            Ok(name) => match GitRef::from_str(&name) {
+                Ok(git_ref) => git_ref,
+                Err(e) => {
+                    eprintln!("✗ ERROR: {}", e);
+                    eprintln!(
+                        "NEXT: Provide the parent branch explicitly or fix the default branch configuration"
+                    );
+                    exit(EXIT_DATAERR);
+                }
+            },
+            Err(message) => {
+                eprintln!("✗ ERROR: {}", message);
+                eprintln!(
+                    "NEXT: Provide the parent branch explicitly or configure init.defaultBranch"
+                );
+                exit(EXIT_DATAERR);
+            }
+        }
+    };
+
     if args.dry_run {
         println!(
             "[DRY RUN] Would push {} to {}/{} (parent={})",
             branch,
             args.remote,
             branch,
-            args.parent.as_str()
+            parent_ref.raw()
         );
-        println!("[DRY RUN] Would fetch {}", args.parent.as_str());
-        println!("[DRY RUN] Would fix branch {}", args.parent.as_str());
-        println!("[DRY RUN] Would push {}:{}", args.parent.as_str(), branch);
-        println!("[DRY RUN] Would set upstream to {}/{}", args.remote, branch);
+        println!("[DRY RUN] Would fetch {}", parent_ref.raw());
+        println!("[DRY RUN] Would fix branch {}", parent_ref.raw());
+        println!("[DRY RUN] Would push {}:{}", parent_ref.raw(), branch);
+        println!(
+            "[DRY RUN] Would set upstream to {}/{} for {}",
+            args.remote, branch, branch
+        );
         println!("[DRY RUN] Would push each commit");
         println!("✓ [DRY RUN] Branch would be pushed successfully");
         exit(EXIT_OK);
@@ -122,24 +158,24 @@ fn main() {
         branch,
         args.remote,
         branch,
-        args.parent.as_str()
+        parent_ref.raw()
     );
 
     // Fetch parent
     git_run(&[
         "fetch",
         &args.remote,
-        &format!("{}:{}", args.parent.as_str(), args.parent.as_str()),
+        &format!("{}:{}", parent_ref.raw(), parent_ref.raw()),
     ]);
 
     // Fix parent branch
-    git_run(&["fix-branch", args.parent.as_str()]);
+    git_run(&["fix-branch", parent_ref.raw()]);
 
     // Push parent to remote branch
     git_run(&[
         "push",
         &args.remote,
-        &format!("{}:{}", args.parent.as_str(), branch),
+        &format!("{}:{}", parent_ref.raw(), branch),
     ]);
 
     // Set upstream
@@ -147,10 +183,11 @@ fn main() {
         "branch",
         "--set-upstream-to",
         &format!("{}/{}", args.remote, branch),
+        &branch,
     ]);
 
     // Push each commit
-    git_run(&["push-each", args.parent.as_str()]);
+    git_run(&["push-each", parent_ref.raw()]);
 
     println!("✓ Branch pushed successfully");
     exit(EXIT_OK);
@@ -193,4 +230,55 @@ fn git_run(args: &[&str]) {
         eprintln!("✗ ERROR: git {} failed", args.join(" "));
         exit(EXIT_SOFTWARE);
     }
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_default_branch(remote: &str) -> Result<String, String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Ok(value);
+    }
+
+    let remote_head = format!("refs/remotes/{}/HEAD", remote);
+    if let Some(symbolic) = git_output_optional(&["symbolic-ref", "--quiet", &remote_head]) {
+        let prefix = format!("refs/remotes/{}/", remote);
+        let trimmed = symbolic
+            .strip_prefix(&prefix)
+            .map(|s| s.to_string())
+            .unwrap_or(symbolic);
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(format!(
+        "Unable to determine default branch (checked init.defaultBranch, {}, and common fallbacks)",
+        remote_head
+    ))
 }
