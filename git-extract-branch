@@ -1,37 +1,236 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! thiserror = "2.0.17"
+//! ```
+//!
+//! Extract N commits of the current branch to a new branch
 
-# Extract N commits of the current branch to a new branch
+use clap::Parser;
+use std::process::{Command, Stdio, exit};
+use std::str::FromStr;
+use thiserror::Error;
 
-set -o errexit -o pipefail -o noglob -o noclobber -o nounset
-IFS=$'\n\t'
+const EXIT_OK: i32 = 0;
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-main() {
-  local -r             \
-    new_branch=$1      \
-    n_commits=$2       \
-    parent=${3-master} \
-    master=${4-master} \
-    remote=${5-origin}
+#[derive(Debug, Error)]
+enum ValidationError {
+    #[error("Git reference cannot be empty")]
+    GitRefEmpty,
 
-  local -r branch=$(git rev-parse --abbrev-ref HEAD)
-  local -r new_branch_head=$(
-    git rev-list "$parent".."$branch" | tail -n "$n_commits" | head -n 1
-  )
+    #[error("Failed to execute git rev-parse")]
+    GitRevParseFailed,
 
-  echo "Extracting ${new_branch}: ${parent}..${new_branch_head}"
-
-  git fetch "$remote" "${master}:${master}"
-  git fix-branch "$master"
-  git checkout -b "$new_branch" "$master"
-  git cherry-pick "${parent}..${new_branch_head}"
-  git fix-branch "$master"
-
-  if [ "$parent" = "$master" ]; then
-    git checkout "$branch"
-    git rebase "$new_branch"
-    git fix-branch
-    git checkout "$new_branch"
-  fi
+    #[error("Git reference not found: {ref_name}")]
+    GitRefNotFound { ref_name: String },
 }
 
-main "$@"
+#[derive(Debug, Clone)]
+struct GitRef(String);
+
+impl FromStr for GitRef {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ValidationError::GitRefEmpty);
+        }
+
+        // Validate that the ref exists using git rev-parse
+        let output = Command::new("git")
+            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
+            .output()
+            .map_err(|_| ValidationError::GitRevParseFailed)?;
+
+        if !output.status.success() {
+            return Err(ValidationError::GitRefNotFound {
+                ref_name: s.to_string(),
+            });
+        }
+
+        // Store the resolved SHA
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(GitRef(sha))
+    }
+}
+
+impl GitRef {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "git-extract-branch")]
+#[command(about = "Extract N commits of the current branch to a new branch", long_about = None)]
+struct Args {
+    /// Name of the new branch to create
+    new_branch: String,
+
+    /// Number of commits to extract
+    n_commits: usize,
+
+    /// Parent commit/branch to extract from
+    #[arg(default_value = "master")]
+    parent: GitRef,
+
+    /// Master branch to base new branch on
+    #[arg(default_value = "master")]
+    master: GitRef,
+
+    /// Remote to fetch from
+    #[arg(default_value = "origin")]
+    remote: String,
+
+    /// Show what would be done without making changes
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Check we're in a git repository
+    let repo_check = Command::new("git")
+        .args(&["rev-parse", "--git-dir"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to execute git rev-parse");
+
+    if !repo_check.success() {
+        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
+        eprintln!("NEXT: cd into a repo, or run: git init");
+        exit(EXIT_DATAERR);
+    }
+
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    // Get the commit hash for the Nth commit from parent
+    let rev_list = git_output(&["rev-list", &format!("{}..{}", args.parent.as_str(), branch)]);
+
+    let commits: Vec<&str> = rev_list.lines().collect();
+    if commits.len() < args.n_commits {
+        eprintln!(
+            "✗ ERROR: Not enough commits. Requested {} but only {} available.",
+            args.n_commits,
+            commits.len()
+        );
+        exit(EXIT_DATAERR);
+    }
+
+    let new_branch_head = commits[commits.len() - args.n_commits];
+
+    if args.dry_run {
+        println!(
+            "[DRY RUN] Would extract {}: {}..{}",
+            args.new_branch,
+            args.parent.as_str(),
+            new_branch_head
+        );
+        println!("[DRY RUN] Would fetch {}", args.master.as_str());
+        println!("[DRY RUN] Would fix branch {}", args.master.as_str());
+        println!(
+            "[DRY RUN] Would create branch {} from {}",
+            args.new_branch,
+            args.master.as_str()
+        );
+        println!(
+            "[DRY RUN] Would cherry-pick {}..{}",
+            args.parent.as_str(),
+            new_branch_head
+        );
+        println!("[DRY RUN] Would fix branch {}", args.new_branch);
+
+        if args.parent.as_str() == args.master.as_str() {
+            println!("[DRY RUN] Would checkout {}", branch);
+            println!("[DRY RUN] Would rebase {} onto {}", branch, args.new_branch);
+            println!("[DRY RUN] Would fix branch {}", branch);
+            println!("[DRY RUN] Would checkout {}", args.new_branch);
+        }
+
+        exit(EXIT_OK);
+    }
+
+    println!(
+        "Extracting {}: {}..{}",
+        args.new_branch,
+        args.parent.as_str(),
+        new_branch_head
+    );
+
+    // Fetch master
+    git_run(&[
+        "fetch",
+        &args.remote,
+        &format!("{}:{}", args.master.as_str(), args.master.as_str()),
+    ]);
+
+    // Fix master branch
+    git_run(&["fix-branch", args.master.as_str()]);
+
+    // Create new branch from master
+    git_run(&["checkout", "-b", &args.new_branch, args.master.as_str()]);
+
+    // Cherry-pick the commits
+    git_run(&[
+        "cherry-pick",
+        &format!("{}..{}", args.parent.as_str(), new_branch_head),
+    ]);
+
+    // Fix the new branch
+    git_run(&["fix-branch", args.master.as_str()]);
+
+    // If parent is master, rebase original branch on new branch
+    if args.parent.as_str() == args.master.as_str() {
+        git_run(&["checkout", &branch]);
+        git_run(&["rebase", &args.new_branch]);
+        git_run(&["fix-branch"]);
+        git_run(&["checkout", &args.new_branch]);
+    }
+
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_run(args: &[&str]) {
+    let status = match Command::new("git").args(args).status() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        exit(EXIT_SOFTWARE);
+    }
+}

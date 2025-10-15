@@ -1,13 +1,64 @@
-#!/usr/bin/env bash
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! ```
+//!
+//! Pull upstream master branch when checking out master locally
 
-# Pull upstream master branch when checking out master locally
+use std::process::{Command, exit};
 
-# shellcheck source=/dev/null
-source "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../strict-mode.sh"
+const EXIT_OK: i32 = 0;
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
-branch=$(git rev-parse --abbrev-ref HEAD)
+fn main() {
+    // Get current branch
+    let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
 
-if [ "$branch" = 'master' ]; then
-  git pull --rebase
-  git prune-all
-fi
+    if branch == "master" {
+        println!("→ Checked out master, pulling and pruning");
+        git_run(&["pull", "--rebase"]);
+        git_run(&["prune-all"]);
+        println!("✓ Master updated");
+    }
+
+    exit(EXIT_OK);
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = match Command::new("git").args(args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            eprintln!("{}", trimmed);
+        }
+        exit(EXIT_SOFTWARE);
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_run(args: &[&str]) {
+    let status = match Command::new("git").args(args).status() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
+            eprintln!("DETAILS: {}", e);
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    if !status.success() {
+        eprintln!("✗ ERROR: git {} failed", args.join(" "));
+        exit(EXIT_SOFTWARE);
+    }
+}
