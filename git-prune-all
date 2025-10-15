@@ -54,7 +54,14 @@ fn main() {
         .status();
 
     // Get default branch
-    let default_branch = git_output(&["config", "init.defaultBranch"]);
+    let default_branch = match resolve_default_branch(&remote) {
+        Ok(name) => name,
+        Err(message) => {
+            eprintln!("✗ ERROR: {}", message);
+            eprintln!("NEXT: Configure init.defaultBranch or set the remote HEAD");
+            exit(EXIT_DATAERR);
+        }
+    };
 
     // Remove remote branches
     println!("→ Pruning merged remote branches");
@@ -171,4 +178,55 @@ fn git_output(args: &[&str]) -> String {
     }
 
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_default_branch(remote: &str) -> Result<String, String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Ok(value);
+    }
+
+    let remote_head = format!("refs/remotes/{}/HEAD", remote);
+    if let Some(symbolic) = git_output_optional(&["symbolic-ref", "--quiet", &remote_head]) {
+        let prefix = format!("refs/remotes/{}/", remote);
+        let trimmed = symbolic
+            .strip_prefix(&prefix)
+            .map(|s| s.to_string())
+            .unwrap_or(symbolic);
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(format!(
+        "Unable to determine default branch (checked init.defaultBranch, {}, and common fallbacks)",
+        remote_head
+    ))
 }

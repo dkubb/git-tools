@@ -3,7 +3,7 @@
 //! [dependencies]
 //! ```
 //!
-//! Pull upstream master branch when checking out master locally
+//! Update the default branch after checkout
 
 use std::process::{Command, exit};
 
@@ -11,17 +11,46 @@ const EXIT_OK: i32 = 0;
 const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
 fn main() {
-    // Get current branch
     let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
 
-    if branch == "master" {
-        println!("→ Checked out master, pulling and pruning");
-        git_run(&["pull", "--rebase"]);
-        git_run(&["prune-all"]);
-        println!("✓ Master updated");
+    if let Some(default_branch) = detect_default_branch() {
+        if branch == default_branch {
+            println!("→ Checked out {}, pulling and pruning", default_branch);
+            git_run(&["pull", "--rebase"]);
+            git_run(&["prune-all"]);
+            println!("✓ {} updated", default_branch);
+        }
     }
 
     exit(EXIT_OK);
+}
+
+fn detect_default_branch() -> Option<String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Some(value);
+    }
+
+    if let Some(remote) = primary_remote() {
+        let remote_head = format!("refs/remotes/{}/HEAD", remote);
+        if let Some(symbolic) = git_output_optional(&["symbolic-ref", "--quiet", &remote_head]) {
+            let prefix = format!("refs/remotes/{}/", remote);
+            if let Some(stripped) = symbolic.strip_prefix(&prefix) {
+                if !stripped.is_empty() {
+                    return Some(stripped.to_string());
+                }
+            } else if !symbolic.is_empty() {
+                return Some(symbolic);
+            }
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
 }
 
 fn git_output(args: &[&str]) -> String {
@@ -61,4 +90,37 @@ fn git_run(args: &[&str]) {
         eprintln!("✗ ERROR: git {} failed", args.join(" "));
         exit(EXIT_SOFTWARE);
     }
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn primary_remote() -> Option<String> {
+    let output = Command::new("git").args(&["remote"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
