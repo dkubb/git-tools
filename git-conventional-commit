@@ -321,6 +321,10 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
+    /// Allow leaving unstaged or untracked changes in the working tree
+    #[arg(long)]
+    allow_dirty: bool,
+
     /// Show verbose output
     #[arg(long, short)]
     verbose: bool,
@@ -352,6 +356,39 @@ fn main() {
         eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
         eprintln!("NEXT: cd into a repo, or run: git init");
         exit(EXIT_DATAERR);
+    }
+
+    if !args.allow_dirty {
+        match collect_unstaged_untracked() {
+            Ok((unstaged, untracked)) => {
+                if !unstaged.is_empty() || !untracked.is_empty() {
+                    eprintln!("✗ ERROR: Unstaged or untracked changes detected");
+                    eprintln!(
+                        "NEXT: Stage changes or rerun with --allow-dirty to allow committing with a dirty working tree"
+                    );
+
+                    if !unstaged.is_empty() {
+                        eprintln!("UNSTAGED:");
+                        for path in &unstaged {
+                            eprintln!("  - {}", path);
+                        }
+                    }
+
+                    if !untracked.is_empty() {
+                        eprintln!("UNTRACKED:");
+                        for path in &untracked {
+                            eprintln!("  - {}", path);
+                        }
+                    }
+
+                    exit(EXIT_DATAERR);
+                }
+            }
+            Err(message) => {
+                eprintln!("✗ ERROR: {}", message);
+                exit(EXIT_SOFTWARE);
+            }
+        }
     }
 
     // Handle fixup commits (GitRef is already validated and resolved to SHA)
@@ -516,4 +553,41 @@ fn new_commit_message(
     }
 
     message_parts.join("\n")
+}
+
+fn collect_unstaged_untracked() -> Result<(Vec<String>, Vec<String>), String> {
+    let unstaged_output = Command::new("git")
+        .args(&["ls-files", "--modified"])
+        .output()
+        .map_err(|e| format!("Failed to execute git ls-files --modified: {}", e))?;
+
+    if !unstaged_output.status.success() {
+        return Err("git ls-files --modified failed".to_string());
+    }
+
+    let unstaged = String::from_utf8_lossy(&unstaged_output.stdout)
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+
+    let untracked_output = Command::new("git")
+        .args(&["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to execute git ls-files --others --exclude-standard: {}",
+                e
+            )
+        })?;
+
+    if !untracked_output.status.success() {
+        return Err("git ls-files --others --exclude-standard failed".to_string());
+    }
+
+    let untracked = String::from_utf8_lossy(&untracked_output.stdout)
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+
+    Ok((unstaged, untracked))
 }
