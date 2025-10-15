@@ -13,7 +13,8 @@ use chrono::DateTime;
 use clap::Parser;
 use filetime::{FileTime, set_file_mtime};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::{Command, Stdio, exit};
 
 const EXIT_OK: i32 = 0;
@@ -46,45 +47,102 @@ fn main() {
         exit(EXIT_DATAERR);
     }
 
+    // List tracked files so we only attempt to sync files that currently exist in the index
+    let tracked_files: HashSet<String> = git_output(&["ls-files"])
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+
     // Get all file timestamps in a single git command for maximum performance
     // This uses git log with --name-only to output all files with their commit timestamps
-    let log_output = git_output(&[
+    let log_output = git_output_raw(&[
         "log",
-        "--all",
-        "--pretty=format:%ct",
+        "HEAD",
+        "--pretty=format:%H%x00%ct%x00",
         "--name-only",
         "--diff-filter=AMCR",
+        "-z",
     ]);
 
-    // Parse the output into a HashMap of file -> timestamp (most recent)
-    let mut file_times: HashMap<String, i64> = HashMap::new();
-    let mut current_timestamp: Option<i64> = None;
+    let tokens: Vec<&[u8]> = log_output
+        .split(|&b| b == b'\0')
+        .filter(|token| !token.is_empty())
+        .collect();
 
-    for line in log_output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    let mut file_times: HashMap<String, i64> = HashMap::new();
+    let mut idx = 0usize;
+    while idx + 1 < tokens.len() {
+        let commit_token = trim_leading_newlines(tokens[idx]);
+        let timestamp_token = trim_leading_newlines(tokens[idx + 1]);
+
+        if !is_commit_hash(commit_token) {
+            idx += 1;
             continue;
         }
 
-        // Try to parse as timestamp first
-        if let Ok(ts) = trimmed.parse::<i64>() {
-            current_timestamp = Some(ts);
-        } else if let Some(ts) = current_timestamp {
-            // It's a filename - only add if we haven't seen it before (keeps most recent)
-            file_times.entry(trimmed.to_string()).or_insert(ts);
+        let commit_time = match parse_timestamp(timestamp_token) {
+            Some(ts) => ts,
+            None => {
+                idx += 1;
+                continue;
+            }
+        };
+
+        idx += 2;
+
+        while idx < tokens.len() {
+            let token = trim_leading_newlines(tokens[idx]);
+            if token.is_empty() {
+                idx += 1;
+                continue;
+            }
+
+            // If the token looks like the start of the next commit and has a timestamp following it, break.
+            if is_commit_hash(token)
+                && idx + 1 < tokens.len()
+                && parse_timestamp(trim_leading_newlines(tokens[idx + 1])).is_some()
+            {
+                break;
+            }
+
+            if let Ok(file) = String::from_utf8(token.to_vec()) {
+                if tracked_files.contains(&file) && !file_times.contains_key(&file) {
+                    file_times.insert(file, commit_time);
+                    if file_times.len() == tracked_files.len() {
+                        break;
+                    }
+                }
+            }
+
+            idx += 1;
+        }
+
+        // Move past any file tokens we consumed; if we exited early due to matching next commit, loop will handle parsing from there.
+        if file_times.len() == tracked_files.len() {
+            break;
         }
     }
 
-    if file_times.is_empty() {
+    // Process files in parallel for maximum performance
+    let entries: Vec<_> = file_times
+        .into_iter()
+        .filter(|(file, _)| tracked_files.contains(file))
+        .collect();
+
+    if entries.is_empty() {
         println!("✓ No files to sync");
         exit(EXIT_OK);
     }
 
-    println!("→ Syncing mtime for {} files", file_times.len());
-
-    // Process files in parallel for maximum performance
-    let entries: Vec<_> = file_times.into_iter().collect();
+    println!("→ Syncing mtime for {} files", entries.len());
     entries.par_iter().for_each(|(file, timestamp)| {
+        let path = Path::new(file);
+        if !path.exists() {
+            return;
+        }
+
         if args.dry_run {
             if let Some(dt) = DateTime::from_timestamp(*timestamp, 0) {
                 println!(
@@ -113,6 +171,11 @@ fn main() {
 }
 
 fn git_output(args: &[&str]) -> String {
+    let stdout = git_output_raw(args);
+    String::from_utf8_lossy(&stdout).trim().to_string()
+}
+
+fn git_output_raw(args: &[&str]) -> Vec<u8> {
     let output = match Command::new("git").args(args).output() {
         Ok(output) => output,
         Err(e) => {
@@ -132,5 +195,28 @@ fn git_output(args: &[&str]) -> String {
         exit(EXIT_SOFTWARE);
     }
 
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    output.stdout
+}
+
+fn parse_timestamp(token: &[u8]) -> Option<i64> {
+    if token.is_empty() || token.iter().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+
+    let value = std::str::from_utf8(token).ok()?;
+    value.parse::<i64>().ok()
+}
+
+fn trim_leading_newlines(token: &[u8]) -> &[u8] {
+    if token.starts_with(b"\r\n") {
+        &token[2..]
+    } else if token.starts_with(b"\n") || token.starts_with(b"\r") {
+        &token[1..]
+    } else {
+        token
+    }
+}
+
+fn is_commit_hash(token: &[u8]) -> bool {
+    token.len() == 40 && token.iter().all(|b| b.is_ascii_hexdigit())
 }
