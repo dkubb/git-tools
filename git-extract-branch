@@ -29,7 +29,10 @@ enum ValidationError {
 }
 
 #[derive(Debug, Clone)]
-struct GitRef(String);
+struct GitRef {
+    raw: String,
+    sha: String,
+}
 
 impl FromStr for GitRef {
     type Err = ValidationError;
@@ -53,13 +56,20 @@ impl FromStr for GitRef {
 
         // Store the resolved SHA
         let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(GitRef(sha))
+        Ok(GitRef {
+            raw: s.to_string(),
+            sha,
+        })
     }
 }
 
 impl GitRef {
-    fn as_str(&self) -> &str {
-        &self.0
+    fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    fn sha(&self) -> &str {
+        &self.sha
     }
 }
 
@@ -74,12 +84,10 @@ struct Args {
     n_commits: usize,
 
     /// Parent commit/branch to extract from
-    #[arg(default_value = "master")]
-    parent: GitRef,
+    parent: Option<GitRef>,
 
     /// Master branch to base new branch on
-    #[arg(default_value = "master")]
-    master: GitRef,
+    master: Option<GitRef>,
 
     /// Remote to fetch from
     #[arg(default_value = "origin")]
@@ -110,10 +118,53 @@ fn main() {
     // Get current branch
     let branch = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
 
-    // Get the commit hash for the Nth commit from parent
-    let rev_list = git_output(&["rev-list", &format!("{}..{}", args.parent.as_str(), branch)]);
+    // Determine default branch once if either positional argument is missing
+    let inferred_default = if args.parent.is_none() || args.master.is_none() {
+        Some(
+            resolve_default_branch(&args.remote).unwrap_or_else(|message| {
+                eprintln!("✗ ERROR: {}", message);
+                eprintln!("NEXT: Provide parent/master explicitly or configure init.defaultBranch");
+                exit(EXIT_DATAERR);
+            }),
+        )
+    } else {
+        None
+    };
 
-    let commits: Vec<&str> = rev_list.lines().collect();
+    let parent_ref = if let Some(provided) = args.parent.clone() {
+        provided
+    } else {
+        let name = inferred_default
+            .as_ref()
+            .expect("default branch should be available when parent is missing");
+        GitRef::from_str(name).unwrap_or_else(|e| {
+            eprintln!("✗ ERROR: {}", e);
+            eprintln!("NEXT: Provide parent explicitly with the <parent> positional argument");
+            exit(EXIT_DATAERR);
+        })
+    };
+
+    let master_ref = if let Some(provided) = args.master.clone() {
+        provided
+    } else {
+        let name = inferred_default
+            .as_ref()
+            .expect("default branch should be available when master is missing");
+        GitRef::from_str(name).unwrap_or_else(|e| {
+            eprintln!("✗ ERROR: {}", e);
+            eprintln!("NEXT: Provide master explicitly with the <master> positional argument");
+            exit(EXIT_DATAERR);
+        })
+    };
+
+    // Get the commit hash for the Nth commit from parent
+    let rev_list = git_output(&["rev-list", &format!("{}..{}", parent_ref.raw(), branch)]);
+
+    let commits: Vec<String> = rev_list
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if commits.len() < args.n_commits {
         eprintln!(
             "✗ ERROR: Not enough commits. Requested {} but only {} available.",
@@ -123,30 +174,34 @@ fn main() {
         exit(EXIT_DATAERR);
     }
 
-    let new_branch_head = commits[commits.len() - args.n_commits];
+    let mut cherry_commits: Vec<String> = commits.iter().take(args.n_commits).cloned().collect();
+    cherry_commits.reverse(); // apply oldest → newest
+
+    let newest_selected = cherry_commits
+        .last()
+        .expect("cherry_commits is non-empty after length check");
 
     if args.dry_run {
         println!(
             "[DRY RUN] Would extract {}: {}..{}",
             args.new_branch,
-            args.parent.as_str(),
-            new_branch_head
+            parent_ref.raw(),
+            newest_selected
         );
-        println!("[DRY RUN] Would fetch {}", args.master.as_str());
-        println!("[DRY RUN] Would fix branch {}", args.master.as_str());
+        println!("[DRY RUN] Would fetch {}", master_ref.raw());
+        println!("[DRY RUN] Would fix branch {}", master_ref.raw());
         println!(
             "[DRY RUN] Would create branch {} from {}",
             args.new_branch,
-            args.master.as_str()
+            master_ref.raw()
         );
         println!(
-            "[DRY RUN] Would cherry-pick {}..{}",
-            args.parent.as_str(),
-            new_branch_head
+            "[DRY RUN] Would cherry-pick commits (oldest→newest): {}",
+            cherry_commits.join(" → ")
         );
         println!("[DRY RUN] Would fix branch {}", args.new_branch);
 
-        if args.parent.as_str() == args.master.as_str() {
+        if parent_ref.raw() == master_ref.raw() {
             println!("[DRY RUN] Would checkout {}", branch);
             println!("[DRY RUN] Would rebase {} onto {}", branch, args.new_branch);
             println!("[DRY RUN] Would fix branch {}", branch);
@@ -159,34 +214,33 @@ fn main() {
     println!(
         "Extracting {}: {}..{}",
         args.new_branch,
-        args.parent.as_str(),
-        new_branch_head
+        parent_ref.raw(),
+        newest_selected
     );
 
     // Fetch master
     git_run(&[
         "fetch",
         &args.remote,
-        &format!("{}:{}", args.master.as_str(), args.master.as_str()),
+        &format!("{}:{}", master_ref.raw(), master_ref.raw()),
     ]);
 
     // Fix master branch
-    git_run(&["fix-branch", args.master.as_str()]);
+    git_run(&["fix-branch", master_ref.raw()]);
 
     // Create new branch from master
-    git_run(&["checkout", "-b", &args.new_branch, args.master.as_str()]);
+    git_run(&["checkout", "-b", &args.new_branch, master_ref.raw()]);
 
-    // Cherry-pick the commits
-    git_run(&[
-        "cherry-pick",
-        &format!("{}..{}", args.parent.as_str(), new_branch_head),
-    ]);
+    // Cherry-pick the commits individually (oldest → newest)
+    for commit in &cherry_commits {
+        git_run(&["cherry-pick", commit]);
+    }
 
     // Fix the new branch
-    git_run(&["fix-branch", args.master.as_str()]);
+    git_run(&["fix-branch", &args.new_branch]);
 
     // If parent is master, rebase original branch on new branch
-    if args.parent.as_str() == args.master.as_str() {
+    if parent_ref.raw() == master_ref.raw() {
         git_run(&["checkout", &branch]);
         git_run(&["rebase", &args.new_branch]);
         git_run(&["fix-branch"]);
@@ -233,4 +287,55 @@ fn git_run(args: &[&str]) {
         eprintln!("✗ ERROR: git {} failed", args.join(" "));
         exit(EXIT_SOFTWARE);
     }
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_default_branch(remote: &str) -> Result<String, String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Ok(value);
+    }
+
+    let remote_head = format!("refs/remotes/{}/HEAD", remote);
+    if let Some(symbolic) = git_output_optional(&["symbolic-ref", "--quiet", &remote_head]) {
+        let prefix = format!("refs/remotes/{}/", remote);
+        let trimmed = symbolic
+            .strip_prefix(&prefix)
+            .map(|s| s.to_string())
+            .unwrap_or(symbolic);
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(format!(
+        "Unable to determine default branch (checked init.defaultBranch, {}, and common fallbacks)",
+        remote_head
+    ))
 }

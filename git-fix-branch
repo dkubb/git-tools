@@ -96,11 +96,20 @@ fn main() {
     let parent = if let Some(p) = args.parent {
         p
     } else {
-        let default_branch = git_output(&["config", "init.defaultBranch"]);
-        match GitRef::from_str(&default_branch) {
-            Ok(git_ref) => git_ref,
-            Err(e) => {
-                eprintln!("✗ ERROR: {}", e);
+        match resolve_default_branch() {
+            Ok(default_branch) => match GitRef::from_str(&default_branch) {
+                Ok(git_ref) => git_ref,
+                Err(e) => {
+                    eprintln!("✗ ERROR: {}", e);
+                    eprintln!(
+                        "NEXT: Provide --parent <branch> or fix the default branch configuration"
+                    );
+                    exit(EXIT_DATAERR);
+                }
+            },
+            Err(message) => {
+                eprintln!("✗ ERROR: {}", message);
+                eprintln!("NEXT: Provide --parent <branch> or configure init.defaultBranch");
                 exit(EXIT_DATAERR);
             }
         }
@@ -157,29 +166,6 @@ export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
     }
 }
 
-fn git_output(args: &[&str]) -> String {
-    let output = match Command::new("git").args(args).output() {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
-            eprintln!("DETAILS: {}", e);
-            exit(EXIT_SOFTWARE);
-        }
-    };
-
-    if !output.status.success() {
-        eprintln!("✗ ERROR: git {} failed", args.join(" "));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let trimmed = stderr.trim();
-        if !trimmed.is_empty() {
-            eprintln!("{}", trimmed);
-        }
-        exit(EXIT_SOFTWARE);
-    }
-
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 fn git_run(args: &[&str]) {
     let status = match Command::new("git").args(args).status() {
         Ok(status) => status,
@@ -194,4 +180,52 @@ fn git_run(args: &[&str]) {
         eprintln!("✗ ERROR: git {} failed", args.join(" "));
         exit(EXIT_SOFTWARE);
     }
+}
+
+fn git_output_optional(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn branch_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_default_branch() -> Result<String, String> {
+    if let Some(value) = git_output_optional(&["config", "init.defaultBranch"]) {
+        return Ok(value);
+    }
+
+    if let Some(symbolic) =
+        git_output_optional(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    {
+        if let Some(stripped) = symbolic.strip_prefix("refs/remotes/origin/") {
+            if !stripped.is_empty() {
+                return Ok(stripped.to_string());
+            }
+        } else if !symbolic.is_empty() {
+            return Ok(symbolic);
+        }
+    }
+
+    for candidate in ["main", "master"] {
+        if branch_exists(candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err("Unable to determine default branch (checked init.defaultBranch, origin/HEAD, and common fallbacks)".to_string())
 }
