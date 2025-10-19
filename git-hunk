@@ -196,7 +196,7 @@ impl FromStr for TrackedFile {
 
         // Check if file is tracked by git
         let tracked_check = Command::new("git")
-            .args(["ls-files", "--error-unmatch", path_str])
+            .args(["ls-files", "--error-unmatch", "--", path_str])
             .output()
             .map_err(|_| ValidationError::GitCommandFailed)?;
 
