@@ -21,8 +21,9 @@ const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
 /// Build git diff command arguments with consistent algorithm
 fn build_diff_args(file: Option<&str>) -> Vec<&str> {
-    let mut args = vec!["diff", "--diff-algorithm", "histogram"];
+    let mut args = vec!["diff", "--diff-algorithm", "histogram", "--unified=0"];
     if let Some(f) = file {
+        args.push("--");
         args.push(f);
     }
     args
