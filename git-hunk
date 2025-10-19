@@ -3,11 +3,14 @@
 //! [dependencies]
 //! clap = { version = "4.5.48", features = ["derive"] }
 //! thiserror = "2.0.17"
+//! shell-escape = "0.1.5"
 //! ```
 //!
 //! Work with git diff hunks - show minimal diffs and stage specific hunks
 
 use clap::{Parser, Subcommand};
+use shell_escape::escape;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,12 +23,30 @@ const EXIT_DATAERR: i32 = 65; // bad input / not found
 const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
 
 /// Build git diff command arguments with consistent algorithm
-fn build_diff_args(file: Option<&str>) -> Vec<&str> {
-    let mut args = vec!["diff", "--diff-algorithm", "histogram", "--unified=0"];
-    if let Some(f) = file {
-        args.push("--");
-        args.push(f);
+fn build_diff_args(file: Option<&RepoPath>) -> Vec<OsString> {
+    let mut args = Vec::new();
+    args.push(OsString::from("diff"));
+
+    let mut needs_no_index = false;
+    if let Some(repo_path) = file {
+        if repo_path.is_untracked() {
+            needs_no_index = true;
+            args.push(OsString::from("--no-index"));
+        }
     }
+
+    args.push(OsString::from("--diff-algorithm"));
+    args.push(OsString::from("histogram"));
+    args.push(OsString::from("--unified=0"));
+
+    if let Some(repo_path) = file {
+        args.push(OsString::from("--"));
+        if needs_no_index {
+            args.push(OsString::from("/dev/null"));
+        }
+        args.push(repo_path.to_os_string());
+    }
+
     args
 }
 
@@ -43,8 +64,8 @@ enum ValidationError {
     #[error("File '{path}' is outside the git repository")]
     FileOutsideRepo { path: String },
 
-    #[error("File '{path}' is not tracked by git")]
-    FileNotTracked { path: String },
+    #[error("File '{path}' does not exist")]
+    FileNotFound { path: String },
 
     #[error("Range cannot be empty")]
     RangeEmpty,
@@ -99,7 +120,7 @@ impl Range {
             1 // Default to 1 if not specified (git does this for single-line changes)
         };
 
-        if start == 0 {
+        if start == 0 && count > 0 {
             return Err(ValidationError::RangeStartZero);
         }
 
@@ -142,16 +163,33 @@ impl<const PREFIX: char> fmt::Display for PrefixedRange<PREFIX> {
 type OldRange = PrefixedRange<'-'>;
 type NewRange = PrefixedRange<'+'>;
 
-#[derive(Debug, Clone)]
-struct TrackedFile(PathBuf);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTracking {
+    Tracked,
+    Untracked,
+}
 
-impl TrackedFile {
-    fn as_path(&self) -> &Path {
-        &self.0
+#[derive(Debug, Clone)]
+struct RepoPath {
+    path: PathBuf,
+    tracking: FileTracking,
+}
+
+impl RepoPath {
+    fn is_untracked(&self) -> bool {
+        matches!(self.tracking, FileTracking::Untracked)
+    }
+
+    fn to_os_string(&self) -> OsString {
+        self.path.as_os_str().to_owned()
+    }
+
+    fn display(&self) -> String {
+        self.path.to_string_lossy().to_string()
     }
 }
 
-impl FromStr for TrackedFile {
+impl FromStr for RepoPath {
     type Err = ValidationError;
 
     fn from_str(path_str: &str) -> Result<Self, Self::Err> {
@@ -201,13 +239,21 @@ impl FromStr for TrackedFile {
             .output()
             .map_err(|_| ValidationError::GitCommandFailed)?;
 
-        if !tracked_check.status.success() {
-            return Err(ValidationError::FileNotTracked {
-                path: path_str.to_string(),
-            });
-        }
+        let tracking = if tracked_check.status.success() {
+            FileTracking::Tracked
+        } else {
+            if !full_path.exists() {
+                return Err(ValidationError::FileNotFound {
+                    path: path_str.to_string(),
+                });
+            }
+            FileTracking::Untracked
+        };
 
-        Ok(TrackedFile(path_buf))
+        Ok(RepoPath {
+            path: path_buf,
+            tracking,
+        })
     }
 }
 
@@ -224,7 +270,7 @@ enum Commands {
     /// Show diff with minimal context (zero lines) for precise hunk identification
     Diff {
         /// File path to show diff for (optional)
-        file: Option<TrackedFile>,
+        file: Option<RepoPath>,
 
         /// Show verbose output
         #[arg(long, short)]
@@ -234,7 +280,7 @@ enum Commands {
     Add {
         /// File path (relative to repository root)
         #[arg(long)]
-        file: TrackedFile,
+        file: RepoPath,
 
         /// Old range from diff (e.g., 12,4)
         #[arg(long)]
@@ -273,7 +319,7 @@ fn main() {
 
     match args.command {
         Commands::Diff { file, verbose } => {
-            show_minimal_diff(file.as_ref().map(|f| f.as_path()), verbose);
+            show_minimal_diff(file.as_ref(), verbose);
         }
         Commands::Add {
             file,
@@ -282,20 +328,21 @@ fn main() {
             dry_run,
             verbose,
         } => {
-            stage_hunk(file.as_path(), &old, &new, dry_run, verbose);
+            stage_hunk(&file, &old, &new, dry_run, verbose);
         }
     }
 
     exit(EXIT_OK);
 }
 
-fn show_minimal_diff(file: Option<&Path>, verbose: bool) {
-    let mut args = vec!["--no-pager"];
-    let file_str = file.map(|p| p.to_string_lossy());
-    args.extend(build_diff_args(file_str.as_deref()));
+fn show_minimal_diff(file: Option<&RepoPath>, verbose: bool) {
+    let mut args = vec![OsString::from("--no-pager")];
+    let diff_args = build_diff_args(file);
+    let used_no_index = diff_args.iter().any(|arg| arg == "--no-index");
+    args.extend(diff_args);
 
     if verbose {
-        eprintln!("→ Running: git {}", args.join(" "));
+        eprintln!("→ Running: {}", format_command("git", &args));
     }
 
     let output = Command::new("git")
@@ -307,23 +354,58 @@ fn show_minimal_diff(file: Option<&Path>, verbose: bool) {
             exit(EXIT_SOFTWARE);
         });
 
-    if !output.status.success() {
+    let status_code = output.status.code();
+    let diff_ok = output.status.success() || (used_no_index && status_code == Some(1));
+
+    if !diff_ok {
         eprintln!("✗ ERROR: git diff failed");
         exit(EXIT_SOFTWARE);
     }
 
     let diff = String::from_utf8_lossy(&output.stdout);
     annotate_diff_with_commands(&diff, file);
+
+    if file.is_none() {
+        warn_if_untracked_files();
+    }
 }
 
-fn annotate_diff_with_commands(diff: &str, file: Option<&Path>) {
-    let mut current_file = file.map(|p| p.to_string_lossy().to_string());
+fn warn_if_untracked_files() {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let status = String::from_utf8_lossy(&output.stdout);
+            if status.lines().any(|line| line.starts_with("?? ")) {
+                eprintln!(
+                    "⚠ WARNING: Untracked files detected. Run `git add --intent-to-add <path>` to work with them."
+                );
+            }
+        }
+    }
+}
+
+fn format_command(cmd: &str, args: &[OsString]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote(OsStr::new(cmd)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg.as_os_str())));
+    parts.join(" ")
+}
+
+fn shell_quote(arg: &OsStr) -> String {
+    escape(arg.to_string_lossy()).into_owned()
+}
+
+fn annotate_diff_with_commands(diff: &str, file: Option<&RepoPath>) {
+    let mut current_file = file.map(|p| p.display());
 
     for line in diff.lines() {
         // Track the current file from diff headers
         if line.starts_with("+++ b/") {
             if let Some(filename) = line.strip_prefix("+++ b/") {
-                current_file = Some(filename.to_string());
+                current_file = Some(filename.trim_end_matches('\t').to_string());
             }
         }
 
@@ -333,9 +415,10 @@ fn annotate_diff_with_commands(diff: &str, file: Option<&Path>) {
                 // Use the current file if available
                 if let Some(ref file_arg) = current_file {
                     // Print the command comment before the @@ line
+                    let quoted_file = shell_quote(OsStr::new(file_arg));
                     println!(
                         "# git hunk add --file {} --old {} --new {}",
-                        file_arg, old_range, new_range
+                        quoted_file, old_range, new_range
                     );
                 }
             }
@@ -361,16 +444,22 @@ fn parse_hunk_header(line: &str) -> Option<(String, String, String)> {
 }
 
 fn stage_hunk(
-    file_path: &Path,
+    file: &RepoPath,
     old_range: &OldRange,
     new_range: &NewRange,
     dry_run: bool,
     verbose: bool,
 ) {
-    let file_str = file_path.to_string_lossy();
+    let file_str = file.display();
 
     // Get current diff for this specific file
-    let diff_args = build_diff_args(Some(file_str.as_ref()));
+    let diff_args = build_diff_args(Some(file));
+    let used_no_index = diff_args.iter().any(|arg| arg == "--no-index");
+
+    if verbose {
+        eprintln!("→ Running: {}", format_command("git", &diff_args));
+    }
+
     let output = Command::new("git")
         .args(&diff_args)
         .output()
@@ -380,7 +469,10 @@ fn stage_hunk(
             exit(EXIT_SOFTWARE);
         });
 
-    if !output.status.success() {
+    let status_code = output.status.code();
+    let diff_ok = output.status.success() || (used_no_index && status_code == Some(1));
+
+    if !diff_ok {
         eprintln!("✗ ERROR: git diff failed for {}", file_str);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let trimmed = stderr.trim();
@@ -423,7 +515,7 @@ fn stage_hunk(
 
             // Apply the patch
             let mut child = Command::new("git")
-                .args(&["apply", "--cached"])
+                .args(&["apply", "--cached", "--unidiff-zero"])
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap_or_else(|e| {
