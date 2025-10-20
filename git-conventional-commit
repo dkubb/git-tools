@@ -325,6 +325,10 @@ struct Args {
     #[arg(long)]
     allow_dirty: bool,
 
+    /// Allow creating a commit with no changes
+    #[arg(long)]
+    allow_empty: bool,
+
     /// Show verbose output
     #[arg(long, short)]
     verbose: bool,
@@ -393,6 +397,12 @@ fn main() {
 
     // Handle fixup commits (GitRef is already validated and resolved to SHA)
     if let Some(fixup_ref) = &args.fixup {
+        if args.allow_empty {
+            eprintln!("✗ ERROR: --allow-empty cannot be used with --fixup");
+            eprintln!("NEXT: Remove --allow-empty (fixup commits should contain changes)");
+            exit(EXIT_USAGE);
+        }
+
         let fixup_sha = fixup_ref.as_str();
 
         if args.dry_run {
@@ -488,6 +498,10 @@ fn main() {
         .arg("commit")
         .arg("--message")
         .arg(&commit_message);
+
+    if args.allow_empty {
+        commit_cmd.arg("--allow-empty");
+    }
 
     for arg in &args.git_args {
         commit_cmd.arg(arg);
