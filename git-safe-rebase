@@ -1,0 +1,429 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [package]
+//! edition = "2024"
+//!
+//! [dependencies]
+//! clap = { version = "4.5.50", features = ["derive"] }
+//! shell-quote = "0.7.2"
+//! ```
+//!
+//! Coordinate a safe `git rebase` invocation with locking, dry-run support, and exec wrapping.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![deny(clippy::nursery)]
+#![deny(clippy::cargo)]
+#![deny(clippy::complexity)]
+#![deny(clippy::correctness)]
+#![deny(clippy::perf)]
+#![deny(clippy::style)]
+#![deny(clippy::suspicious)]
+#![expect(
+    clippy::blanket_clippy_restriction_lints,
+    reason = "Required to enable the clippy::restriction lint group"
+)]
+#![deny(clippy::restriction)]
+#![deny(
+    clippy::exhaustive_enums,
+    reason = "force all enums to use allow(clippy::exhaustive_enums)"
+)]
+#![deny(
+    clippy::exhaustive_structs,
+    reason = "force all structs to use allow(clippy::exhaustive_structs)"
+)]
+#![expect(
+    clippy::implicit_return,
+    reason = "Implicit returns keep the code idiomatic while restriction lint conflicts with pedantic"
+)]
+#![expect(
+    clippy::question_mark_used,
+    reason = "The `?` operator makes error handling concise without sacrificing clarity"
+)]
+#![expect(
+    clippy::print_stderr,
+    reason = "CLI script reports diagnostics directly to stderr"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "CLI script reports user-facing messages directly to stdout"
+)]
+#![expect(
+    clippy::cargo_common_metadata,
+    reason = "rust-script generates temporary packages without distribution metadata"
+)]
+
+use clap::Parser;
+use shell_quote::{Bash, Quote as _};
+use std::env;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::{self, Command, ExitStatus, Stdio};
+
+/// Success exit code
+const EXIT_OK: i32 = 0;
+/// Invalid arguments exit code
+const EXIT_USAGE: i32 = 64;
+/// Bad input or invalid git state exit code
+const EXIT_DATAERR: i32 = 65;
+/// Internal failure exit code
+const EXIT_SOFTWARE: i32 = 70;
+
+/// Safe git rebase with conflict retry and locking
+#[derive(Parser)]
+#[command(
+    bin_name = "git-safe-rebase",
+    disable_help_subcommand = true,
+    trailing_var_arg = true
+)]
+struct Cli {
+    /// Enable dry-run mode (show what would be done without executing)
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+
+    /// Policy for wrapping exec commands (nonempty or always)
+    #[arg(long = "exec-policy", value_name = "POLICY")]
+    exec_policy: Option<String>,
+
+    /// Only finish an in-progress rebase (equivalent to `git rebase --edit-todo`)
+    #[arg(long = "finish")]
+    finish_only: bool,
+
+    /// Arguments to pass through to `git rebase`
+    #[arg(value_name = "REBASE_ARG", allow_hyphen_values = true)]
+    rebase_args: Vec<String>,
+}
+
+/// Processed arguments split into editor and rebase options
+struct ParsedArgs {
+    /// Whether to run in dry-run mode
+    dry_run: bool,
+    /// Options to pass to the editor component
+    editor_opts: Vec<String>,
+    /// Whether to only finish an existing rebase
+    finish_only: bool,
+    /// Arguments to pass to git rebase
+    rebase_args: Vec<String>,
+}
+
+/// Builds editor command string from binary and options
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper keeps orchestration readable even though it is invoked once"
+)]
+fn build_editor_command(bin: &str, opts: &[String]) -> String {
+    let capacity = opts.iter().fold(bin.len(), |acc, opt| {
+        acc.saturating_add(opt.len().saturating_add(1))
+    });
+    let mut result = String::with_capacity(capacity);
+    result.push_str(bin);
+    for opt in opts {
+        result.push(' ');
+        result.push_str(opt);
+    }
+    result
+}
+
+/// Extracts user's exec command from rebase args
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper isolates exec parsing logic even though run() is the only caller"
+)]
+fn detect_user_exec(args: &[String]) -> String {
+    let mut iter = args.iter();
+    let mut result: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--exec" => {
+                if let Some(val) = iter.next() {
+                    result = Some(val.clone());
+                }
+            }
+            _ => {
+                if let Some(rest) = arg.strip_prefix("--exec=") {
+                    result = Some(rest.to_owned());
+                }
+            }
+        }
+    }
+    result.unwrap_or_else(|| "true".to_owned())
+}
+
+/// Verifies current directory is a git repository
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper encapsulates git probe even though called from a single path"
+)]
+fn ensure_git_repo() -> Result<(), (i32, String)> {
+    let status = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| (EXIT_SOFTWARE, format!("failed to detect git repo: {error}")))?;
+
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| (EXIT_DATAERR, "not a git repo".to_owned()))
+}
+
+/// Adds `--interactive` if not already present
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper toggles flag insertion even with single use"
+)]
+fn force_interactive(args: &mut Vec<String>) {
+    if !should_force_interactive(args) {
+        return;
+    }
+    args.insert(0, "--interactive".to_owned());
+}
+
+/// Returns absolute path to .git directory
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper isolates git-dir resolution for clarity"
+)]
+fn git_dir() -> Result<PathBuf, (i32, String)> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .output()
+        .map_err(|error| {
+            (
+                EXIT_SOFTWARE,
+                format!("failed to execute git rev-parse: {error}"),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .map_or_else(
+                || "not a git repository".to_owned(),
+                |line| format!("git error: {line}"),
+            );
+        return Err((EXIT_DATAERR, message));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    let git_dir_path = PathBuf::from(path);
+    if git_dir_path.is_absolute() {
+        Ok(git_dir_path)
+    } else {
+        Ok(env::current_dir()
+            .map_err(|error| (EXIT_SOFTWARE, format!("failed to read cwd: {error}")))?
+            .join(git_dir_path))
+    }
+}
+
+/// Returns true if a rebase is in progress
+#[expect(
+    clippy::single_call_fn,
+    reason = "Utility probes git state even though run() is the lone consumer"
+)]
+fn is_mid_rebase() -> bool {
+    git_dir()
+        .is_ok_and(|dir| dir.join("rebase-merge").is_dir() || dir.join("rebase-apply").is_dir())
+}
+
+/// Runs main logic and exits with status code
+fn main() {
+    match run() {
+        Ok(code) => process::exit(code),
+        Err((code, message)) => {
+            eprintln!("{message}");
+            process::exit(code);
+        }
+    }
+}
+
+/// Parses CLI args and splits into editor/rebase options
+#[expect(
+    clippy::single_call_fn,
+    reason = "Builder keeps argument parsing isolated despite single entry point"
+)]
+fn parse_args() -> Result<ParsedArgs, (i32, String)> {
+    let cli =
+        Cli::try_parse_from(sanitized_cli_args()).map_err(|err| (EXIT_USAGE, err.to_string()))?;
+
+    let mut rebase_args = cli.rebase_args;
+    if !cli.finish_only {
+        force_interactive(&mut rebase_args);
+    }
+
+    let mut editor_opts = Vec::new();
+    if cli.dry_run {
+        editor_opts.push("--dry-mode".into());
+    }
+    if cli.finish_only {
+        editor_opts.push("--finish".into());
+    }
+    if let Some(policy) = cli.exec_policy.as_ref() {
+        editor_opts.push("--exec-policy".into());
+        editor_opts.push(policy.clone());
+    }
+
+    let sequence_editor = env::var("GIT_SEQUENCE_EDITOR").unwrap_or_default();
+    if !sequence_editor.trim().is_empty() {
+        editor_opts.push("--sequence-editor".into());
+        editor_opts.push(sequence_editor);
+    }
+
+    Ok(ParsedArgs {
+        dry_run: cli.dry_run,
+        finish_only: cli.finish_only,
+        editor_opts,
+        rebase_args,
+    })
+}
+
+/// Executes git rebase with custom editor and exec wrapper
+#[expect(
+    clippy::single_call_fn,
+    reason = "Main routine stays isolated despite being invoked once"
+)]
+fn run() -> Result<i32, (i32, String)> {
+    let args = parse_args()?;
+    ensure_git_repo()?;
+    let mid_rebase = is_mid_rebase();
+
+    let editor_bin =
+        env::var("SAFE_REBASE_EDITOR").unwrap_or_else(|_| "git-safe-rebase-editor".to_owned());
+    let editor_command = build_editor_command(&editor_bin, &args.editor_opts);
+    let user_exec = detect_user_exec(&args.rebase_args);
+
+    if args.finish_only {
+        if !mid_rebase {
+            return Ok(EXIT_DATAERR);
+        }
+        if args.dry_run {
+            println!("[dry] would set env:");
+            let editor_quoted: String = Bash::quote(editor_command.as_str());
+            let exec_quoted: String = Bash::quote(user_exec.as_str());
+            println!("  GIT_SEQUENCE_EDITOR={editor_quoted}");
+            println!("  SAFE_REBASE_EXEC_COMMAND={exec_quoted}");
+            println!("[dry] would run: git rebase --edit-todo");
+            return Ok(EXIT_OK);
+        }
+        let status = Command::new("git")
+            .arg("rebase")
+            .arg("--edit-todo")
+            .env("GIT_SEQUENCE_EDITOR", &editor_command)
+            .env("SAFE_REBASE_EXEC_COMMAND", &user_exec)
+            .status()
+            .map_err(|error| {
+                (
+                    EXIT_SOFTWARE,
+                    format!("failed to run git rebase --edit-todo: {error}"),
+                )
+            })?;
+
+        return Ok(status_code(status));
+    }
+
+    if args.dry_run {
+        println!("[dry] would set env:");
+        let editor_quoted: String = Bash::quote(editor_command.as_str());
+        let exec_quoted: String = Bash::quote(user_exec.as_str());
+        println!("  GIT_SEQUENCE_EDITOR={editor_quoted}");
+        println!("  SAFE_REBASE_EXEC_COMMAND={exec_quoted}");
+        let pretty_args = args
+            .rebase_args
+            .iter()
+            .map(|arg| Bash::quote(arg.as_str()))
+            .collect::<Vec<String>>()
+            .join(" ");
+        println!("[dry] would run: git rebase {pretty_args}");
+        return Ok(EXIT_OK);
+    }
+
+    let status = Command::new("git")
+        .arg("rebase")
+        .args(&args.rebase_args)
+        .env("GIT_SEQUENCE_EDITOR", &editor_command)
+        .env("SAFE_REBASE_EXEC_COMMAND", &user_exec)
+        .status()
+        .map_err(|error| (EXIT_SOFTWARE, format!("failed to run git rebase: {error}")))?;
+    Ok(status_code(status))
+}
+
+/// Reorders args to parse tool options before rebase args
+#[expect(
+    clippy::single_call_fn,
+    reason = "Argument sanitizer exists for clarity even though parse_args() is sole caller"
+)]
+fn sanitized_cli_args() -> Vec<OsString> {
+    let args: Vec<OsString> = env::args_os().collect();
+    if args.is_empty() {
+        return args;
+    }
+
+    let mut reordered = Vec::with_capacity(args.len());
+    if let Some(first) = args.first() {
+        reordered.push(first.clone());
+    }
+
+    let mut ours: Vec<OsString> = Vec::new();
+    let mut passthrough: Vec<OsString> = Vec::new();
+
+    let mut iter = args.into_iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        let Some(value) = arg.to_str() else {
+            passthrough.push(arg);
+            continue;
+        };
+
+        if value == "--" {
+            passthrough.push(arg);
+            passthrough.extend(iter);
+            break;
+        }
+
+        match value {
+            "--dry-run" | "--finish" => ours.push(arg),
+            _ if value.starts_with("--exec-policy=") => ours.push(arg),
+            "--exec-policy" => {
+                ours.push(arg);
+                if let Some(next) = iter.next() {
+                    ours.push(next);
+                }
+            }
+            _ => passthrough.push(arg),
+        }
+    }
+
+    reordered.extend(ours);
+    reordered.extend(passthrough);
+    reordered
+}
+
+/// Returns true if `--interactive` should be added
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper keeps argument policy decisions isolated despite one caller"
+)]
+fn should_force_interactive(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-i" | "--interactive"
+                | "--continue"
+                | "--abort"
+                | "--skip"
+                | "--quit"
+                | "--edit-todo"
+                | "--show-current-patch"
+        )
+    }) && !args.iter().any(|arg| arg.as_str() == "--")
+}
+
+/// Extracts exit code from process status
+fn status_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(EXIT_SOFTWARE)
+}

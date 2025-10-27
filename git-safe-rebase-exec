@@ -1,0 +1,299 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [package]
+//! edition = "2024"
+//!
+//! [dependencies]
+//! clap = { version = "4.5.50", features = ["derive"] }
+//! ```
+//!
+//! Run `git rebase` exec commands with retry, backoff, and empty-commit skipping support.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![deny(clippy::nursery)]
+#![deny(clippy::cargo)]
+#![deny(clippy::complexity)]
+#![deny(clippy::correctness)]
+#![deny(clippy::perf)]
+#![deny(clippy::style)]
+#![deny(clippy::suspicious)]
+#![expect(
+    clippy::blanket_clippy_restriction_lints,
+    reason = "Required to enable the clippy::restriction lint group"
+)]
+#![deny(clippy::restriction)]
+#![deny(
+    clippy::exhaustive_enums,
+    reason = "force all enums to use allow(clippy::exhaustive_enums)"
+)]
+#![deny(
+    clippy::exhaustive_structs,
+    reason = "force all structs to use allow(clippy::exhaustive_structs)"
+)]
+#![expect(
+    clippy::implicit_return,
+    reason = "Implicit returns keep the control flow clear while restriction conflicts with pedantic"
+)]
+#![expect(
+    clippy::question_mark_used,
+    reason = "The `?` operator keeps error propagation concise"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "CLI script reports user-facing messages directly to stdout"
+)]
+#![expect(
+    clippy::print_stderr,
+    reason = "CLI script reports diagnostics directly to stderr"
+)]
+#![expect(
+    clippy::cargo_common_metadata,
+    reason = "rust-script creates temporary crates without package metadata"
+)]
+
+use clap::{Parser, ValueEnum};
+use core::time::Duration;
+use std::process::{self, Command, Stdio};
+use std::thread::sleep;
+
+/// Success exit code
+const EXIT_OK: i32 = 0;
+/// Invalid arguments exit code
+const EXIT_USAGE: i32 = 64;
+/// Internal failure exit code
+const EXIT_SOFTWARE: i32 = 70;
+/// Temporary failure (conflicts, retryable errors) exit code
+const EXIT_TEMPFAIL: i32 = 75;
+
+/// Execution phase for the wrapped command
+#[derive(Clone, Copy, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum Phase {
+    /// Run after applying commit (no retry)
+    PostApply,
+    /// Run before applying commit (can retry on failure)
+    Preflight,
+}
+
+/// Exec wrapper with retry logic for git rebase
+#[derive(Parser)]
+#[command(
+    bin_name = "git-safe-rebase-exec",
+    disable_help_subcommand = true,
+    trailing_var_arg = true
+)]
+struct Cli {
+    /// Exponential backoff duration between retries
+    #[arg(long = "backoff", value_parser = parse_backoff, default_value = "0")]
+    backoff: Duration,
+
+    /// Command to execute
+    #[arg(value_name = "COMMAND", num_args = 1.., allow_hyphen_values = true)]
+    command: Vec<String>,
+
+    /// Dry-run mode (show command without executing)
+    #[arg(long = "dry-mode")]
+    dry_mode: bool,
+
+    /// Execution phase (preflight or post-apply)
+    #[arg(long = "phase", value_enum)]
+    phase: Phase,
+
+    /// Number of retry attempts on failure
+    #[arg(long = "retry", default_value_t = 0)]
+    retry: u32,
+
+    /// Skip execution if commit is empty
+    #[arg(long = "skip-if-empty")]
+    skip_if_empty: bool,
+}
+
+/// Parsed configuration from CLI arguments
+struct Config {
+    /// Backoff duration
+    backoff: Duration,
+    /// Command string to execute
+    command: String,
+    /// Dry-run mode flag
+    dry_mode: bool,
+    /// Execution phase
+    phase: Phase,
+    /// Number of retries
+    retry: u32,
+    /// Whether to skip empty commits
+    skip_if_empty: bool,
+}
+
+/// Formats duration as human-readable string (e.g., "2.5s")
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper converts durations to strings even though only logging uses it"
+)]
+fn format_duration(dur: Duration) -> String {
+    if dur.as_secs() == 0 && dur.subsec_nanos() == 0 {
+        "0s".to_owned()
+    } else if dur.subsec_nanos() == 0 {
+        format!("{}s", dur.as_secs())
+    } else {
+        format!("{:.3}s", dur.as_secs_f64())
+    }
+}
+
+/// Returns true if HEAD commit has file changes
+/// Returns false if HEAD commit is empty (no changes)
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper probes git diff-tree for clarity despite one call site"
+)]
+fn has_nonempty_commit() -> Result<bool, (i32, String)> {
+    let status = Command::new("git")
+        .arg("diff-tree")
+        .arg("--no-commit-id")
+        .arg("-r")
+        .arg("--exit-code")
+        .arg("HEAD")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| (EXIT_SOFTWARE, format!("git diff-tree failed: {error}")))?;
+    Ok(!status.success())
+}
+
+/// Runs main logic and exits with status code
+fn main() {
+    match run() {
+        Ok(code) => process::exit(code),
+        Err((code, message)) => {
+            eprintln!("{message}");
+            process::exit(code);
+        }
+    }
+}
+
+/// Parses CLI arguments into configuration
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser isolates Clap usage even though run() is single caller"
+)]
+fn parse_args() -> Result<Config, String> {
+    let cli = Cli::try_parse().map_err(|err| err.to_string())?;
+    let Cli {
+        backoff,
+        command,
+        dry_mode,
+        phase,
+        retry,
+        skip_if_empty,
+    } = cli;
+
+    let joined_command = command.join(" ");
+
+    Ok(Config {
+        backoff,
+        command: joined_command,
+        dry_mode,
+        phase,
+        retry,
+        skip_if_empty,
+    })
+}
+
+/// Parses backoff duration string (e.g., "2.5s" or "2.5")
+fn parse_backoff(value: &str) -> Result<Duration, String> {
+    const MAX_SECONDS: f64 = 300.0;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Duration::from_secs(0));
+    }
+    let numeric = trimmed
+        .strip_suffix('s')
+        .map_or(trimmed, |stripped| stripped);
+    let seconds: f64 = numeric
+        .parse()
+        .map_err(|parse_error| format!("invalid number for --backoff: {parse_error}"))?;
+    if seconds.is_sign_negative() {
+        return Err("backoff must be non-negative".to_owned());
+    }
+    if seconds > MAX_SECONDS {
+        return Err(format!("backoff must be <= {MAX_SECONDS} seconds"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// Executes command with phase-appropriate retry logic
+#[expect(
+    clippy::single_call_fn,
+    reason = "Main routine stays encapsulated despite single caller"
+)]
+fn run() -> Result<i32, (i32, String)> {
+    let config = parse_args().map_err(|msg| (EXIT_USAGE, msg))?;
+
+    if config.dry_mode {
+        println!("[dry] would run: {}", config.command);
+        return Ok(EXIT_OK);
+    }
+
+    match config.phase {
+        Phase::Preflight => {
+            if run_with_retries(&config.command, config.retry, config.backoff)? {
+                Ok(EXIT_OK)
+            } else {
+                eprintln!("preflight failed");
+                Ok(EXIT_TEMPFAIL)
+            }
+        }
+        Phase::PostApply => {
+            if config.skip_if_empty && !has_nonempty_commit()? {
+                eprintln!("skipping exec: commit is empty (policy skip-if-empty)");
+                return Ok(EXIT_OK);
+            }
+
+            if run_with_retries(&config.command, config.retry, config.backoff)? {
+                Ok(EXIT_OK)
+            } else {
+                eprintln!("post-apply exec failed");
+                Ok(EXIT_TEMPFAIL)
+            }
+        }
+    }
+}
+
+/// Executes shell command and returns success status
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper encapsulates shell execution despite run_with_retries() being sole caller"
+)]
+fn run_shell_command(cmd: &str) -> Result<bool, (i32, String)> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .map_err(|error| {
+            (
+                EXIT_SOFTWARE,
+                format!("failed to execute shell command: {error}"),
+            )
+        })?;
+    Ok(status.success())
+}
+
+/// Runs command with exponential backoff retry logic
+fn run_with_retries(cmd: &str, retry: u32, backoff: Duration) -> Result<bool, (i32, String)> {
+    let attempts = retry.saturating_add(1);
+    let mut current = 1;
+    loop {
+        if run_shell_command(cmd)? {
+            return Ok(true);
+        }
+        if current >= attempts {
+            return Ok(false);
+        }
+        eprint!("exec failed (attempt {current}/{attempts});");
+        eprintln!(" sleeping {}...", format_duration(backoff));
+        sleep(backoff);
+        current = current.saturating_add(1);
+    }
+}
