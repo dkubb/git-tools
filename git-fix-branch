@@ -31,6 +31,21 @@ enum ValidationError {
 #[derive(Debug, Clone)]
 struct GitRef(String);
 
+fn validate_git_ref(ref_name: &str) -> Result<String, ValidationError> {
+    let output = Command::new("git")
+        .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", ref_name)])
+        .output()
+        .map_err(|_| ValidationError::GitRevParseFailed)?;
+
+    if !output.status.success() {
+        return Err(ValidationError::GitRefNotFound {
+            ref_name: ref_name.to_string(),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 impl FromStr for GitRef {
     type Err = ValidationError;
 
@@ -40,19 +55,7 @@ impl FromStr for GitRef {
         }
 
         // Validate that the ref exists using git rev-parse
-        let output = Command::new("git")
-            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
-            .output()
-            .map_err(|_| ValidationError::GitRevParseFailed)?;
-
-        if !output.status.success() {
-            return Err(ValidationError::GitRefNotFound {
-                ref_name: s.to_string(),
-            });
-        }
-
-        // Store the resolved SHA
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let sha = validate_git_ref(s)?;
         Ok(GitRef(sha))
     }
 }
@@ -73,32 +76,47 @@ struct Args {
     /// Show what would be done without making changes
     #[arg(long)]
     dry_run: bool,
+
+    /// Rewrite the entire branch back to the repository root
+    #[arg(long)]
+    root: bool,
 }
 
 fn main() {
-    let args = Args::parse();
+    let Args {
+        parent,
+        dry_run,
+        root,
+    } = Args::parse();
 
     // Check we're in a git repository
-    let repo_check = Command::new("git")
+    if Command::new("git")
         .args(&["rev-parse", "--git-dir"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("Failed to execute git rev-parse");
-
-    if !repo_check.success() {
+        .map_or(true, |status| !status.success())
+    {
         eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
         eprintln!("NEXT: cd into a repo, or run: git init");
         exit(EXIT_DATAERR);
     }
 
+    if root && parent.is_some() {
+        eprintln!("✗ ERROR: --root cannot be used together with a parent reference.");
+        eprintln!("NEXT: Omit the parent argument when using --root.");
+        exit(EXIT_DATAERR);
+    }
+
     // Get parent branch - use default if not provided
-    let parent = if let Some(p) = args.parent {
-        p
+    let parent = if root {
+        None
+    } else if let Some(p) = parent {
+        Some(p)
     } else {
         match resolve_default_branch() {
             Ok(default_branch) => match GitRef::from_str(&default_branch) {
-                Ok(git_ref) => git_ref,
+                Ok(git_ref) => Some(git_ref),
                 Err(e) => {
                     eprintln!("✗ ERROR: {}", e);
                     eprintln!(
@@ -115,19 +133,60 @@ fn main() {
         }
     };
 
-    if args.dry_run {
-        println!("→ [DRY RUN] Would rebase on {}", parent.as_str());
-        println!("→ [DRY RUN] Would fix committer data to match author data");
+    if dry_run {
+        if let Some(ref parent) = parent {
+            println!("→ [DRY RUN] Would rebase on {}", parent.as_str());
+        } else {
+            println!("→ [DRY RUN] Would skip rebase (root mode)");
+        }
+        if root {
+            println!("→ [DRY RUN] Would fix committer data from the repository root");
+        } else {
+            println!("→ [DRY RUN] Would fix committer data to match author data");
+        }
         println!("✓ [DRY RUN] Branch would be fixed successfully");
         exit(EXIT_OK);
     }
 
     // Rebase the current branch on top of the parent
-    println!("→ Rebasing on {}", parent.as_str());
-    git_run(&["rebase", "--rebase-merges", "--", parent.as_str()]);
+    if let Some(ref parent) = parent {
+        println!("→ Rebasing on {}", parent.as_str());
+        git_run(&["rebase", "--rebase-merges", "--", parent.as_str()]);
+    } else {
+        println!("→ Skipping rebase (root mode)");
+    }
+
+    // Prepare the commit range we're going to inspect or rewrite
+    let parent_range = parent.as_ref().map(|p| format!("{}..HEAD", p.as_str()));
+    let commit_range = match (&parent_range, root) {
+        (Some(range), false) => CommitRange::ParentRange(range.clone()),
+        (None, true) => CommitRange::RootRange,
+        _ => {
+            eprintln!("✗ ERROR: Unexpected state while determining commit range.");
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    // Short-circuit when everything already matches
+    match branch_needs_fix(&commit_range) {
+        Ok(false) => {
+            println!("→ Commits already have matching committer data");
+            println!("✓ No rewrite needed");
+            exit(EXIT_OK);
+        }
+        Ok(true) => { /* continue */ }
+        Err(message) => {
+            eprintln!("✗ ERROR: {message}");
+            exit(EXIT_SOFTWARE);
+        }
+    }
 
     // Rewrite all commits to use the author data
-    println!("→ Fixing committer data to match author data");
+    if root {
+        println!("→ Fixing committer data to match author data from the repository root");
+    } else {
+        println!("→ Fixing committer data to match author data");
+    }
 
     let env_filter = r#"
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
@@ -135,26 +194,53 @@ export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
 "#;
 
-    let range = format!("{}..HEAD", parent.as_str());
+    let mut command = Command::new("git");
+    command.args(&[
+        "filter-branch",
+        "--force",
+        "--env-filter",
+        env_filter,
+        "--"
+    ]);
 
-    let status = Command::new("git")
-        .args(&[
-            "filter-branch",
-            "--force",
-            "--env-filter",
-            env_filter,
-            "--",
-            &range,
-        ])
+    match (&commit_range, root) {
+        (CommitRange::ParentRange(range), false) => {
+            command.arg(range);
+        }
+        (CommitRange::RootRange, true) => {
+            command.args(&["--root", "HEAD"]);
+        }
+        _ => {
+            eprintln!("✗ ERROR: Unexpected state while preparing git filter-branch.");
+            exit(EXIT_SOFTWARE);
+        }
+    }
+
+    let result = command
         .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
-        .status();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
 
-    match status {
-        Ok(s) if s.success() => {
+    match result {
+        Ok(output) if output.status.success() => {
+            emit_filter_branch_output(&output.stdout, &output.stderr);
+
+            match git_head_sha() {
+                Ok(after_head) => {
+                    println!("Rewrite {}", after_head);
+                }
+                Err(message) => {
+                    eprintln!("✗ ERROR: {message}");
+                    exit(EXIT_SOFTWARE);
+                }
+            }
+
             println!("✓ Branch fixed successfully");
             exit(EXIT_OK);
         }
-        Ok(_) => {
+        Ok(output) => {
+            emit_filter_branch_output(&output.stdout, &output.stderr);
             eprintln!("✗ ERROR: git filter-branch failed");
             exit(EXIT_SOFTWARE);
         }
@@ -212,20 +298,100 @@ fn resolve_default_branch() -> Result<String, String> {
     if let Some(symbolic) =
         git_output_optional(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
     {
-        if let Some(stripped) = symbolic.strip_prefix("refs/remotes/origin/") {
-            if !stripped.is_empty() {
-                return Ok(stripped.to_string());
+        let branch_name = symbolic
+            .strip_prefix("refs/remotes/origin/")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&symbolic);
+
+        if !branch_name.is_empty() {
+            return Ok(branch_name.to_string());
+        }
+    }
+
+    ["main", "master"]
+        .iter()
+        .find(|&&candidate| branch_exists(candidate))
+        .map(|candidate| candidate.to_string())
+        .ok_or_else(|| {
+            "Unable to determine default branch (checked init.defaultBranch, origin/HEAD, and common fallbacks)".to_string()
+        })
+}
+
+#[derive(Clone)]
+enum CommitRange {
+    ParentRange(String),
+    RootRange,
+}
+
+fn branch_needs_fix(range: &CommitRange) -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.args(&[
+        "log",
+        "--format=%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd"
+    ]);
+
+    match range {
+        CommitRange::ParentRange(spec) => command.arg(spec),
+        CommitRange::RootRange => command.arg("HEAD"),
+    };
+
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to inspect commit metadata: {e}"))?;
+
+    if !output.status.success() {
+        return Err("git log failed when checking commit metadata".to_string());
+    }
+
+    if output.stdout.is_empty() {
+        return Ok(false);
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\0');
+        let author_name = parts.next().unwrap_or_default();
+        let author_email = parts.next().unwrap_or_default();
+        let author_date = parts.next().unwrap_or_default();
+        let committer_name = parts.next().unwrap_or_default();
+        let committer_email = parts.next().unwrap_or_default();
+        let committer_date = parts.next().unwrap_or_default();
+
+        if author_name != committer_name
+            || author_email != committer_email
+            || author_date != committer_date
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn git_head_sha() -> Result<String, String> {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| format!("Failed to determine current HEAD: {e}"))
+        .and_then(|output| {
+            if !output.status.success() {
+                return Err("git rev-parse HEAD failed".to_string());
             }
-        } else if !symbolic.is_empty() {
-            return Ok(symbolic);
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+}
+
+fn emit_filter_branch_output(stdout: &[u8], stderr: &[u8]) {
+    for content in [stdout, stderr] {
+        if content.is_empty() {
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(content).replace('\r', "\n");
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if line.starts_with("Rewrite ") {
+                continue;
+            }
+            println!("{}", line);
         }
     }
-
-    for candidate in ["main", "master"] {
-        if branch_exists(candidate) {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    Err("Unable to determine default branch (checked init.defaultBranch, origin/HEAD, and common fallbacks)".to_string())
 }
