@@ -2,35 +2,44 @@
 //! ```cargo
 //! [dependencies]
 //! clap = { version = "4.5.48", features = ["derive"] }
+//! non-empty-string = "0.2.0"
+//! nonempty = "0.12.0"
 //! regex = "1.11"
+//! strum = { version = "0.27.2", features = ["derive"] }
 //! thiserror = "2.0.17"
 //! ```
 //!
 //! Create a conventional commit with proper formatting
 
 use clap::{Parser, ValueEnum};
-use regex::Regex;
-use std::process::{Command, Stdio, exit};
+use non_empty_string::NonEmptyString;
+use nonempty::NonEmpty;
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::fs;
+use std::process::{Command, exit};
 use std::str::FromStr;
+use strum::IntoEnumIterator;
 use thiserror::Error;
 
 const EXIT_OK: i32 = 0;
-const EXIT_USAGE: i32 = 64; // command line usage error
-const EXIT_DATAERR: i32 = 65; // bad input / not found
-const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
+const EXIT_USAGE: i32 = 64;
+const EXIT_SOFTWARE: i32 = 70;
+const ACTION_MAX_LEN: usize = 70;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "lowercase")]
 enum CommitType {
-    Fix,
-    Feat,
-    Docs,
-    Style,
-    Refactor,
-    Perf,
-    Test,
     Build,
+    Chore,
     Ci,
+    Docs,
+    Feat,
+    Fix,
+    Perf,
+    Refactor,
+    Style,
+    Test,
     Revert,
 }
 
@@ -43,52 +52,11 @@ impl std::fmt::Display for CommitType {
 #[derive(Debug, Error)]
 enum ValidationError {
     #[error("Summary is required")]
-    SummaryEmpty,
-
-    #[error("Summary must be a single line")]
-    SummaryMultiline,
-
-    #[error("Summary should not end with a period")]
-    SummaryEndsWithPeriod,
-
-    #[error("Scope must be a single line")]
-    ScopeMultiline,
-
-    #[error("Scope must not contain a closing parenthesis")]
-    ScopeHasClosingParen,
-
-    #[error("Scope cannot be empty when explicitly provided")]
-    ScopeEmpty,
-
-    #[error("Body cannot be empty when explicitly provided")]
-    BodyEmpty,
-
-    #[error("Breaking note cannot be empty")]
-    BreakingNoteEmpty,
-
-    #[error("Breaking note must be a single line")]
-    BreakingNoteMultiline,
-
-    #[error("Body line too long ({len} chars). Max 72 characters per line.\nLine: {line}")]
-    BodyLineTooLong { len: usize, line: String },
-
-    #[error("Git reference cannot be empty")]
-    GitRefEmpty,
-
-    #[error("Failed to execute git rev-parse")]
-    GitRevParseFailed,
-
-    #[error("Git reference not found: {ref_name}")]
-    GitRefNotFound { ref_name: String },
-
-    #[error(
-        "Subject too long ({len} > 50).\nGiven current type/scope/bang, you have ~{budget} chars for --summary.\nSubject: {subject}"
-    )]
-    SubjectTooLong {
-        len: usize,
-        budget: usize,
-        subject: String,
-    },
+    SummaryMissing,
+    #[error("action must start with one of {allowed} - got '{word}'")]
+    ActionInvalidVerb { word: String, allowed: String },
+    #[error("action descriptions must contain a verb")]
+    ActionMissingVerb,
 }
 
 #[derive(Debug, Clone)]
@@ -98,152 +66,10 @@ impl FromStr for CommitSummary {
     type Err = ValidationError;
 
     fn from_str(raw_summary: &str) -> Result<Self, Self::Err> {
-        if raw_summary.is_empty() {
-            return Err(ValidationError::SummaryEmpty);
+        if raw_summary.trim().is_empty() {
+            return Err(ValidationError::SummaryMissing);
         }
-
-        let re = Regex::new(r"\s+").unwrap();
-        let summary = re.replace_all(raw_summary.trim(), " ").to_string();
-
-        if summary.contains('\n') {
-            return Err(ValidationError::SummaryMultiline);
-        }
-
-        if summary.ends_with('.') {
-            return Err(ValidationError::SummaryEndsWithPeriod);
-        }
-
-        Ok(CommitSummary(summary))
-    }
-}
-
-impl CommitSummary {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CommitScope(String);
-
-impl FromStr for CommitScope {
-    type Err = ValidationError;
-
-    fn from_str(raw_scope: &str) -> Result<Self, Self::Err> {
-        let scope = raw_scope.trim();
-
-        if scope.is_empty() {
-            return Err(ValidationError::ScopeEmpty);
-        }
-
-        if scope.contains('\n') {
-            return Err(ValidationError::ScopeMultiline);
-        }
-        if scope.contains(')') {
-            return Err(ValidationError::ScopeHasClosingParen);
-        }
-        Ok(CommitScope(scope.to_string()))
-    }
-}
-
-impl CommitScope {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CommitBody(String);
-
-impl FromStr for CommitBody {
-    type Err = ValidationError;
-
-    fn from_str(raw_body: &str) -> Result<Self, Self::Err> {
-        let body = raw_body.trim();
-
-        if body.is_empty() {
-            return Err(ValidationError::BodyEmpty);
-        }
-
-        for line in body.lines() {
-            if !line.is_empty() && line.len() > 72 {
-                return Err(ValidationError::BodyLineTooLong {
-                    len: line.len(),
-                    line: line.to_string(),
-                });
-            }
-        }
-
-        Ok(CommitBody(body.to_string()))
-    }
-}
-
-impl CommitBody {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BreakingNote(String);
-
-impl FromStr for BreakingNote {
-    type Err = ValidationError;
-
-    fn from_str(raw_note: &str) -> Result<Self, Self::Err> {
-        if raw_note.is_empty() {
-            return Ok(BreakingNote(String::new()));
-        }
-
-        let note = raw_note.trim();
-        if note.is_empty() {
-            return Err(ValidationError::BreakingNoteEmpty);
-        }
-        if note.contains('\n') {
-            return Err(ValidationError::BreakingNoteMultiline);
-        }
-        Ok(BreakingNote(note.to_string()))
-    }
-}
-
-impl BreakingNote {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct GitRef(String);
-
-impl FromStr for GitRef {
-    type Err = ValidationError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(ValidationError::GitRefEmpty);
-        }
-
-        // Validate that the ref exists using git rev-parse
-        let output = Command::new("git")
-            .args(&["rev-parse", "--verify", &format!("{}^{{commit}}", s)])
-            .output()
-            .map_err(|_| ValidationError::GitRevParseFailed)?;
-
-        if !output.status.success() {
-            return Err(ValidationError::GitRefNotFound {
-                ref_name: s.to_string(),
-            });
-        }
-
-        // Store the resolved SHA
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(GitRef(sha))
-    }
-}
-
-impl GitRef {
-    fn as_str(&self) -> &str {
-        &self.0
+        Ok(CommitSummary(raw_summary.trim().to_string()))
     }
 }
 
@@ -251,37 +77,11 @@ impl GitRef {
 struct CommitSubject(String);
 
 impl CommitSubject {
-    fn new(
-        commit_type: CommitType,
-        scope: Option<&CommitScope>,
-        summary: &CommitSummary,
-        breaking_note: Option<&BreakingNote>,
-    ) -> Result<Self, ValidationError> {
-        let bang = if breaking_note.is_some() { "!" } else { "" };
-
-        let subject = if let Some(scope) = scope {
-            format!(
-                "{}({}){}: {}",
-                commit_type,
-                scope.as_str(),
-                bang,
-                summary.as_str()
-            )
-        } else {
-            format!("{}{}: {}", commit_type, bang, summary.as_str())
+    fn new(commit_type: CommitType, scope: Option<&NonEmptyString>, summary: &CommitSummary) -> Result<Self, ValidationError> {
+        let subject = match scope {
+            Some(scope) => format!("{commit_type}({}): {}", scope.as_str(), summary.0),
+            None => format!("{commit_type}: {}", summary.0),
         };
-
-        let subject_length = subject.len();
-        if subject_length > 50 {
-            let prefix_without_summary = subject.replace(summary.as_str(), "");
-            let budget = 50 - prefix_without_summary.len();
-            return Err(ValidationError::SubjectTooLong {
-                len: subject_length,
-                budget,
-                subject,
-            });
-        }
-
         Ok(CommitSubject(subject))
     }
 
@@ -290,165 +90,243 @@ impl CommitSubject {
     }
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumIter,
+    strum::EnumString,
+)]
+#[repr(u8)]
+enum Verb {
+    Remove = 0,
+    Fix = 1,
+    Refactor = 2,
+    Move = 3,
+    Rename = 4,
+    Change = 5,
+    Add = 6,
+    Upgrade = 7,
+    Downgrade = 8,
+}
+
+impl Verb {
+    fn allowed_list() -> String {
+        Self::iter()
+            .map(|verb| verb.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn parse(verb_str: &str) -> Result<Self, ValidationError> {
+        verb_str.parse().map_err(|_err| {
+            ValidationError::ActionInvalidVerb {
+                word: verb_str.to_owned(),
+                allowed: Self::allowed_list(),
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Action {
+    detail: String,
+    verb: Verb,
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.verb, self.detail)
+    }
+}
+
+impl Action {
+    fn new(raw: &str) -> Result<Self, ValidationError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ValidationError::ActionMissingVerb);
+        }
+
+        let (verb_raw, detail_raw) = trimmed
+            .split_once(' ')
+            .ok_or(ValidationError::ActionMissingVerb)?;
+        let verb = Verb::parse(verb_raw)?;
+        let detail = detail_raw.trim();
+        
+        // Ensure detail ends with a period
+        let detail = if detail.ends_with('.') {
+            detail.to_owned()
+        } else {
+            format!("{}.", detail)
+        };
+        
+        Ok(Self {
+            detail,
+            verb,
+        })
+    }
+}
+
+impl PartialOrd for Action {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Action {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.verb.cmp(&other.verb) {
+            Ordering::Equal => self.detail.cmp(&other.detail),
+            ordering @ (Ordering::Less | Ordering::Greater) => ordering,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActionList {
+    actions: Vec<Action>,
+}
+
+impl ActionList {
+    fn body(&self) -> String {
+        self.actions
+            .iter()
+            .flat_map(|action| self.to_body_lines(action))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn to_body_lines(&self, action: &Action) -> Vec<String> {
+        let mut result = Vec::new();
+        let text = action.to_string();
+
+        for paragraph in text.lines().filter(|line| !line.trim().is_empty()) {
+            let words: Vec<&str> = paragraph.split_whitespace().collect();
+            if words.is_empty() {
+                continue;
+            }
+
+            let mut current_line = String::new();
+
+            for word in words {
+                if current_line.is_empty() {
+                    current_line.push_str(word);
+                } else if current_line
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(word.len())
+                    <= ACTION_MAX_LEN
+                {
+                    current_line.push(' ');
+                    current_line.push_str(word);
+                } else {
+                    // Current line is full, push it and start a new line
+                    if result.is_empty() {
+                        result.push(format!("- {current_line}"));
+                    } else {
+                        result.push(format!("  {current_line}"));
+                    }
+                    word.clone_into(&mut current_line);
+                }
+            }
+
+            // Push the last line
+            if !current_line.is_empty() {
+                if result.is_empty() {
+                    result.push(format!("- {current_line}"));
+                } else {
+                    result.push(format!("  {current_line}"));
+                }
+            }
+        }
+
+        result
+    }
+
+    fn from_nonempty(list: NonEmpty<Action>) -> Self {
+        let mut dedup: HashSet<Action> = HashSet::from_iter(list);
+        let mut actions: Vec<_> = dedup.drain().collect();
+        actions.sort();
+        Self { actions }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "git-conventional-commit")]
 #[command(about = "Create a conventional commit with proper formatting", long_about = None)]
 struct Args {
-    /// Commit type
+    #[arg(long = "action", value_name = "TEXT", required = true)]
+    actions: Vec<String>,
+
     commit_type: CommitType,
 
-    /// Commit summary (required unless using --fixup)
+    #[arg(long)]
+    scope: Option<NonEmptyString>,
+
     #[arg(long)]
     summary: Option<CommitSummary>,
 
-    /// Optional scope for the commit
-    #[arg(long)]
-    scope: Option<CommitScope>,
-
-    /// Optional commit body
-    #[arg(long)]
-    body: Option<CommitBody>,
-
-    /// Optional breaking change note
-    #[arg(long)]
-    breaking_note: Option<BreakingNote>,
-
-    /// Commit SHA to create fixup commit for
-    #[arg(long)]
-    fixup: Option<GitRef>,
-
-    /// Show what would be done without making changes
     #[arg(long)]
     dry_run: bool,
 
-    /// Allow leaving unstaged or untracked changes in the working tree
     #[arg(long)]
     allow_dirty: bool,
 
-    /// Allow creating a commit with no changes
-    #[arg(long)]
-    allow_empty: bool,
+    #[arg(long, conflicts_with = "allow_dirty")]
+    empty: bool,
 
-    /// Show verbose output
-    #[arg(long, short)]
-    verbose: bool,
-
-    /// Additional arguments to pass to git commit
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    git_args: Vec<String>,
+    /// Create an autosquash reword commit for the given commit.
+    /// This creates a commit equivalent to `git commit --fixup=reword:<commit>`
+    /// while enforcing conventional commit validations for the new message.
+    #[arg(long, value_name = "COMMIT")]
+    reword: Option<String>,
 }
 
 fn main() {
-    // Handle --help in raw args before clap parsing
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        Args::parse_from(&["git-conventional-commit", "--help"]);
+        Args::parse_from(["git-conventional-commit", "--help"]);
+        return;
+    }
+
+    if raw_args.len() <= 1 {
+        Args::parse_from(["git-conventional-commit", "--help"]);
         return;
     }
 
     let args = Args::parse();
 
-    // Check we're in a git repository
-    let repo_check = Command::new("git")
-        .args(&["rev-parse", "--git-dir"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("Failed to execute git rev-parse");
-
-    if !repo_check.success() {
-        eprintln!("✗ ERROR: Not a git repository (or any of the parent directories).");
-        eprintln!("NEXT: cd into a repo, or run: git init");
-        exit(EXIT_DATAERR);
-    }
-
-    if !args.allow_dirty {
-        match collect_unstaged_untracked() {
-            Ok((unstaged, untracked)) => {
-                if !unstaged.is_empty() || !untracked.is_empty() {
-                    eprintln!("✗ ERROR: Unstaged or untracked changes detected");
-                    eprintln!(
-                        "NEXT: Stage changes or rerun with --allow-dirty to allow committing with a dirty working tree"
-                    );
-
-                    if !unstaged.is_empty() {
-                        eprintln!("UNSTAGED:");
-                        for path in &unstaged {
-                            eprintln!("  - {}", path);
-                        }
-                    }
-
-                    if !untracked.is_empty() {
-                        eprintln!("UNTRACKED:");
-                        for path in &untracked {
-                            eprintln!("  - {}", path);
-                        }
-                    }
-
-                    exit(EXIT_DATAERR);
-                }
-            }
-            Err(message) => {
-                eprintln!("✗ ERROR: {}", message);
-                exit(EXIT_SOFTWARE);
-            }
-        }
-    }
-
-    // Handle fixup commits (GitRef is already validated and resolved to SHA)
-    if let Some(fixup_ref) = &args.fixup {
-        if args.allow_empty {
-            eprintln!("✗ ERROR: --allow-empty cannot be used with --fixup");
-            eprintln!("NEXT: Remove --allow-empty (fixup commits should contain changes)");
+    let parsed_actions = args
+        .actions
+        .into_iter()
+        .map(|raw| Action::new(&raw))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            eprintln!("✗ ERROR: {}", e);
             exit(EXIT_USAGE);
-        }
+        });
 
-        let fixup_sha = fixup_ref.as_str();
+    let non_empty = NonEmpty::from_vec(parsed_actions).unwrap();
+    let action_list = ActionList::from_nonempty(non_empty);
 
-        if args.dry_run {
-            println!(
-                "[DRY RUN] Would create fixup commit for {}",
-                &fixup_sha[..7]
-            );
-            println!("[DRY RUN] Would run: git commit --fixup {}", fixup_sha);
-            exit(EXIT_OK);
-        }
-
-        let mut cmd = Command::new("git");
-        cmd.arg("commit").arg("--fixup").arg(fixup_sha);
-
-        for arg in &args.git_args {
-            cmd.arg(arg);
-        }
-
-        let status = cmd.status().expect("Failed to execute git commit");
-
-        if !status.success() {
-            eprintln!("✗ ERROR: git commit failed");
-            exit(status.code().unwrap_or(EXIT_SOFTWARE));
-        }
-
-        exit(EXIT_OK);
-    }
-
-    // Validate that summary is provided when not using fixup
     let summary = args
         .summary
         .as_ref()
         .ok_or_else(|| {
-            eprintln!("✗ ERROR: --summary is required when not using --fixup");
-            eprintln!("NEXT: Add --summary <text> or use --fixup <commit>");
+            eprintln!("✗ ERROR: --summary is required");
+            eprintln!("NEXT: Add --summary <text>");
             exit(EXIT_USAGE);
         })
         .unwrap();
 
-    let commit_type = args.commit_type;
-    let scope = args.scope.as_ref();
-    let breaking_note = args.breaking_note.as_ref();
-    let body = args.body.as_ref();
-
-    // Build full commit message
-    let subject = match CommitSubject::new(commit_type, scope, summary, breaking_note) {
+    let subject = match CommitSubject::new(args.commit_type, args.scope.as_ref(), summary) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("✗ ERROR: {}", e);
@@ -456,152 +334,127 @@ fn main() {
         }
     };
 
-    let commit_message = new_commit_message(&subject, body, breaking_note);
-
-    if args.verbose || args.dry_run {
-        println!("→ Commit message:");
-        for line in commit_message.lines() {
-            println!("  {}", line);
-        }
+    let action_body = action_list.body();
+    if action_body.contains("\n\n") {
+        eprintln!("✗ ERROR: internal error: action list contains blank lines");
+        eprintln!("NEXT: This should be impossible; please report this bug");
+        exit(EXIT_SOFTWARE);
     }
 
-    if args.dry_run {
-        println!("✓ [DRY RUN] Commit message would be valid");
-        exit(EXIT_OK);
-    }
+    let conventional_message = format!("{}\n\n{}", subject.as_str(), action_body);
 
-    // Run commitizen validation if available
-    let cz_check = Command::new("cz")
-        .args(&["check", "--message", &commit_message])
-        .output();
+    let final_message = if let Some(ref commit) = args.reword {
+        let output = Command::new("git")
+            .args(["log", "-1", "--pretty=%s", commit])
+            .output()
+            .expect("Failed to execute git log");
 
-    if let Ok(output) = cz_check {
         if !output.status.success() {
-            let error_output = if output.stderr.is_empty() {
-                String::from_utf8_lossy(&output.stdout)
-            } else {
-                String::from_utf8_lossy(&output.stderr)
-            };
+            eprintln!("✗ ERROR: failed to resolve commit '{commit}'");
+            exit(output.status.code().unwrap_or(EXIT_USAGE));
+        }
 
-            eprintln!("✗ ERROR: Commit message does not follow conventional commit format");
-            eprintln!("{}", error_output.trim());
-            eprintln!();
-            eprintln!("MESSAGE:");
-            eprintln!("{}", commit_message);
+        let target_subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if target_subject.is_empty() {
+            eprintln!("✗ ERROR: commit '{commit}' has an empty subject");
+            exit(EXIT_USAGE);
+        }
+
+        format!("amend! {target_subject}\n\n{conventional_message}")
+    } else {
+        conventional_message.clone()
+    };
+
+    // Check for clean working tree when --empty is used
+    if args.empty {
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("Failed to execute git status");
+
+        if !output.status.success() {
+            eprintln!("✗ ERROR: git status failed");
+            exit(output.status.code().unwrap_or(EXIT_SOFTWARE));
+        }
+
+        if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            eprintln!("✗ ERROR: working tree is not clean");
+            eprintln!("NEXT: Use --allow-dirty or stage/unstage changes first");
             exit(EXIT_USAGE);
         }
     }
 
-    // Create commit
+    if args.dry_run {
+        println!("→ Commit message:");
+        for line in final_message.lines() {
+            println!("  {}", line);
+        }
+        println!("✓ [DRY RUN] Commit message would be valid");
+        exit(EXIT_OK);
+    }
+
     let mut commit_cmd = Command::new("git");
     commit_cmd
-        .arg("commit")
-        .arg("--message")
-        .arg(&commit_message);
-
-    if args.allow_empty {
+        .arg("commit");
+    
+    if args.empty {
         commit_cmd.arg("--allow-empty");
     }
 
-    for arg in &args.git_args {
-        commit_cmd.arg(arg);
-    }
+    let mut tmp_dir_to_cleanup: Option<std::path::PathBuf> = None;
 
-    let commit_output = commit_cmd.output();
+    if let Some(commit) = args.reword.as_deref() {
+        // git commit does not allow -m/-F with --fixup=reword, so we overwrite
+        // the editor buffer with our validated conventional message.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "git-conventional-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp_dir).expect("Failed to create temp directory");
 
-    match commit_output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            print!("{}", stdout);
+        let msg_path = tmp_dir.join("message.txt");
+        fs::write(&msg_path, &final_message).expect("Failed to write temp message file");
 
-            // Parse branch, commit_id, and subject from git commit output
-            let first_line = stdout.lines().next().unwrap_or("");
+        let editor_path = tmp_dir.join("editor.sh");
+        fs::write(
+            &editor_path,
+            "#!/bin/sh\ncat \"$GIT_CONVENTIONAL_COMMIT_MSG\" > \"$1\"\n",
+        )
+        .expect("Failed to write temp editor script");
 
-            if first_line.contains("detached HEAD") {
-                let re = Regex::new(r"\[detached HEAD ([^\]]+)\] (.+)").unwrap();
-                if let Some(caps) = re.captures(first_line) {
-                    if args.verbose {
-                        println!("✓ Created commit {} with subject: {}", &caps[1], &caps[2]);
-                    }
-                }
-            } else {
-                let re = Regex::new(r"\[([^ ]+) ([^\]]+)\] (.+)").unwrap();
-                if let Some(caps) = re.captures(first_line) {
-                    if args.verbose {
-                        println!(
-                            "✓ Created commit {} on branch {} with subject: {}",
-                            &caps[2], &caps[1], &caps[3]
-                        );
-                    }
-                }
-            }
-            exit(EXIT_OK);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&editor_path)
+                .expect("Failed to stat temp editor script")
+                .permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&editor_path, perms).expect("Failed to chmod temp editor script");
         }
-        Ok(output) => {
-            eprintln!("✗ ERROR: Failed to create commit (git hooks or other error)");
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            exit(output.status.code().unwrap_or(EXIT_SOFTWARE));
-        }
-        Err(e) => {
-            eprintln!("✗ ERROR: Failed to run git commit: {}", e);
-            exit(EXIT_SOFTWARE);
-        }
-    }
-}
 
-fn new_commit_message(
-    subject: &CommitSubject,
-    body: Option<&CommitBody>,
-    breaking_note: Option<&BreakingNote>,
-) -> String {
-    let mut message_parts = vec![subject.as_str().to_string()];
+        commit_cmd.arg(format!("--fixup=reword:{commit}"));
+        commit_cmd.env("GIT_CONVENTIONAL_COMMIT_MSG", &msg_path);
+        commit_cmd.env("GIT_EDITOR", &editor_path);
 
-    if let Some(body) = body {
-        message_parts.push(String::new());
-        message_parts.push(body.as_str().to_string());
+        tmp_dir_to_cleanup = Some(tmp_dir);
+    } else {
+        commit_cmd.arg("--message").arg(&final_message);
     }
 
-    if let Some(breaking_note) = breaking_note {
-        message_parts.push(String::new());
-        message_parts.push(format!("BREAKING CHANGE: {}", breaking_note.as_str()));
+    let status = commit_cmd.status().expect("Failed to execute git commit");
+
+    if let Some(tmp_dir) = tmp_dir_to_cleanup {
+        let _ = fs::remove_dir_all(tmp_dir);
     }
 
-    message_parts.join("\n")
-}
-
-fn collect_unstaged_untracked() -> Result<(Vec<String>, Vec<String>), String> {
-    let unstaged_output = Command::new("git")
-        .args(&["ls-files", "--modified"])
-        .output()
-        .map_err(|e| format!("Failed to execute git ls-files --modified: {}", e))?;
-
-    if !unstaged_output.status.success() {
-        return Err("git ls-files --modified failed".to_string());
+    if !status.success() {
+        eprintln!("✗ ERROR: git commit failed");
+        exit(status.code().unwrap_or(EXIT_SOFTWARE));
     }
 
-    let unstaged = String::from_utf8_lossy(&unstaged_output.stdout)
-        .lines()
-        .map(|line| line.to_string())
-        .collect();
-
-    let untracked_output = Command::new("git")
-        .args(&["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to execute git ls-files --others --exclude-standard: {}",
-                e
-            )
-        })?;
-
-    if !untracked_output.status.success() {
-        return Err("git ls-files --others --exclude-standard failed".to_string());
-    }
-
-    let untracked = String::from_utf8_lossy(&untracked_output.stdout)
-        .lines()
-        .map(|line| line.to_string())
-        .collect();
-
-    Ok((unstaged, untracked))
+    println!("✓ Commit created successfully");
 }
