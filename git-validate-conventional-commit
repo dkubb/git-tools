@@ -1,0 +1,59 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! git-conventional-commit-rules = { path = "crates/git-conventional-commit-rules" }
+//! ```
+//!
+//! Validate a commit message using the same rules as git-conventional-commit
+
+use clap::Parser;
+use git_conventional_commit_rules::validate_commit_message;
+use std::fs;
+use std::path::PathBuf;
+use std::process::exit;
+
+const EXIT_OK: i32 = 0;
+const EXIT_USAGE: i32 = 64; // command line usage error
+const EXIT_DATAERR: i32 = 65; // bad input / not found
+
+#[derive(Parser, Debug)]
+#[command(name = "git-validate-conventional-commit")]
+#[command(about = "Validate a commit message against git-conventional-commit rules", long_about = None)]
+struct Args {
+    /// Path to the commit message file (as passed to the commit-msg hook)
+    path: PathBuf,
+}
+
+fn main() {
+    // Handle --help in raw args before clap parsing
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        Args::parse_from(&["git-validate-conventional-commit", "--help"]);
+        return;
+    }
+
+    if raw_args.len() <= 1 {
+        Args::parse_from(&["git-validate-conventional-commit", "--help"]);
+        exit(EXIT_USAGE);
+    }
+
+    let args = Args::parse();
+
+    let message = fs::read_to_string(&args.path).unwrap_or_else(|e| {
+        eprintln!("✗ ERROR: Failed to read commit message file: {}", args.path.display());
+        eprintln!("DETAILS: {}", e);
+        exit(EXIT_DATAERR);
+    });
+
+    if let Err(e) = validate_commit_message(&message) {
+        eprintln!("✗ ERROR: Commit message is invalid");
+        eprintln!("DETAILS: {}", e);
+        eprintln!();
+        eprintln!("MESSAGE (raw):");
+        eprintln!("{}", message.trim_end());
+        exit(EXIT_USAGE);
+    }
+
+    exit(EXIT_OK);
+}
