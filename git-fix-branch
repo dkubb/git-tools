@@ -89,15 +89,21 @@ enum ValidationError {
     RefEmpty,
 
     /// Reference was not found in the repository
-    #[error("Git reference not found: {ref_name}")]
+    #[error("Git reference not found: {ref_name}\nDETAILS: {details}")]
     RefNotFound {
         /// The name of the reference that was not found
         ref_name: String,
+
+        /// Underlying git error message (if any)
+        details: String,
     },
 
     /// Failed to execute git rev-parse command
-    #[error("Failed to execute git rev-parse")]
-    RevParseFailed,
+    #[error("Failed to execute git rev-parse: {details}")]
+    RevParseFailed {
+        /// Underlying OS error (if any)
+        details: String,
+    },
 }
 
 /// A validated git reference containing its commit SHA
@@ -158,11 +164,20 @@ fn validate_git_ref(ref_name: &str) -> Result<String, ValidationError> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", &format!("{ref_name}^{{commit}}")])
         .output()
-        .map_err(|_e| ValidationError::RevParseFailed)?;
+        .map_err(|e| ValidationError::RevParseFailed {
+            details: e.to_string(),
+        })?;
 
     if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let details = if details.is_empty() {
+            String::from("git rev-parse failed")
+        } else {
+            details
+        };
         return Err(ValidationError::RefNotFound {
             ref_name: ref_name.to_owned(),
+            details,
         });
     }
 
