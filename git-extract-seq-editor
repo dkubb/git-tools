@@ -1,0 +1,156 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! clap = { version = "4.5.48", features = ["derive"] }
+//! shell-escape = "0.1.5"
+//! thiserror = "2.0.17"
+//! ```
+//!
+//! Custom rebase sequence editor used by git-extract.
+
+use clap::Parser;
+use shell_escape::escape;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio, exit};
+use thiserror::Error;
+
+const EXIT_SOFTWARE: i32 = 70; // unexpected internal failure
+
+#[derive(Parser, Debug)]
+#[command(name = "git-extract-seq-editor")]
+#[command(about = "Rewrite git rebase todo for git-extract workflow")]
+struct Args {
+    /// Path to the git rebase todo file
+    #[arg(value_name = "TODO_FILE")]
+    todo_file: PathBuf,
+}
+
+#[derive(Debug, Error)]
+enum SeqEditorError {
+    #[error("Failed to read todo file: {0}")]
+    ReadTodo(#[source] std::io::Error),
+
+    #[error("Failed to write todo file: {0}")]
+    WriteTodo(#[source] std::io::Error),
+
+    #[error("Git command failed: {0}")]
+    GitCommand(String),
+}
+
+fn main() {
+    let args = Args::parse();
+
+    if let Err(err) = process_todo(&args.todo_file) {
+        eprintln!("✗ ERROR: {}", err);
+        exit(EXIT_SOFTWARE);
+    }
+}
+
+fn process_todo(todo_path: &Path) -> Result<(), SeqEditorError> {
+    let original = std::fs::read_to_string(todo_path).map_err(SeqEditorError::ReadTodo)?;
+
+    let commits = extract_commits(&original);
+    if commits.is_empty() {
+        return Ok(());
+    }
+
+    let commit_start = commits.first().expect("non-empty vector after check");
+    let commit_end = commits.last().expect("non-empty vector after check");
+
+    let added_paths = list_added_paths(commit_start, commit_end)?;
+    let prologue = build_prologue(commit_end, &added_paths);
+
+    let mut updated = String::new();
+    updated.push_str(&prologue);
+    updated.push('\n');
+    updated.push_str(&original);
+
+    std::fs::write(todo_path, updated).map_err(SeqEditorError::WriteTodo)
+}
+
+fn extract_commits(todo_contents: &str) -> Vec<String> {
+    todo_contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("pick"), Some(sha)) if sha.len() >= 7 && sha.chars().all(is_hex) => {
+                    Some(sha.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn is_hex(c: char) -> bool {
+    matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F')
+}
+
+fn build_prologue(commit_end: &str, added_paths: &[String]) -> String {
+    let mut prologue = String::new();
+    prologue.push_str(&format!(
+        "exec git restore --source {} --worktree .\n",
+        commit_end
+    ));
+    prologue.push_str("break\n");
+
+    for path in added_paths {
+        let escaped = escape(Cow::from(path.as_str()));
+        prologue.push_str(&format!("exec git clean --force --quiet -- {}\n", escaped));
+    }
+
+    prologue
+}
+
+fn list_added_paths(commit_start: &str, commit_end: &str) -> Result<Vec<String>, SeqEditorError> {
+    let parent_spec = format!("{}^", commit_start);
+    let has_parent = Command::new("git")
+        .args(["rev-parse", "--verify", "-q", &parent_spec])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| SeqEditorError::GitCommand(e.to_string()))?
+        .success();
+
+    let mut cmd = Command::new("git");
+    if has_parent {
+        cmd.args([
+            "diff-tree",
+            "--name-only",
+            "--diff-filter",
+            "A",
+            &parent_spec,
+            commit_end,
+        ]);
+    } else {
+        cmd.args([
+            "diff-tree",
+            "--name-only",
+            "--diff-filter",
+            "A",
+            "--root",
+            commit_end,
+        ]);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| SeqEditorError::GitCommand(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(SeqEditorError::GitCommand(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+
+    Ok(paths)
+}
