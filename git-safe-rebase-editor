@@ -853,6 +853,8 @@ fn launch_editor(cmd: &[String]) -> Result<(), (i32, String)> {
     reason = "Need explicit File handle to attach contextual error messages"
 )]
 fn lock_is_stale(pid_path: &Path) -> Result<bool, (i32, String)> {
+    let lock_age = lock_dir_age(pid_path);
+
     let mut buf = String::new();
     match File::open(pid_path) {
         Ok(mut file) => {
@@ -867,15 +869,7 @@ fn lock_is_stale(pid_path: &Path) -> Result<bool, (i32, String)> {
             // PID file missing - could be mid-creation or abandoned lock.
             // Check lock directory age: if > LOCK_STALE_GRACE, assume crashed during creation.
             // If fresh, another process may still be writing the PID file.
-            let parent = pid_path.parent().unwrap_or_else(|| Path::new("."));
-            if let Ok(meta) = fs::metadata(parent)
-                && let Ok(modified) = meta.modified()
-                && let Ok(age) = SystemTime::now().duration_since(modified)
-                && age > LOCK_STALE_GRACE
-            {
-                return Ok(true);
-            }
-            return Ok(false);
+            return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE));
         }
         Err(err) => {
             return Err((
@@ -887,25 +881,66 @@ fn lock_is_stale(pid_path: &Path) -> Result<bool, (i32, String)> {
 
     let trimmed = buf.trim();
     if trimmed.is_empty() {
+        return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE));
+    }
+
+    let pid: i32 = match trimmed.parse() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE)),
+    };
+
+    if pid_is_running(pid) {
         return Ok(false);
     }
 
-    // Parse PID but don't check if process is running - just rely on time-based staleness
-    let _pid: i32 = match trimmed.parse() {
-        Ok(pid) => pid,
-        Err(_) => return Ok(false),
-    };
+    Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE))
+}
 
-    // Check if lock directory is older than grace period
+fn lock_dir_age(pid_path: &Path) -> Option<Duration> {
     let parent = pid_path.parent().unwrap_or_else(|| Path::new("."));
-    if let Ok(meta) = fs::metadata(parent)
-        && let Ok(modified) = meta.modified()
-        && let Ok(age) = SystemTime::now().duration_since(modified)
-        && age > LOCK_STALE_GRACE
+    let meta = fs::metadata(parent).ok()?;
+    let modified = meta.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+fn pid_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let pid_str = pid.to_string();
+
+    #[cfg(unix)]
     {
-        Ok(true)
-    } else {
-        Ok(false)
+        if let Ok(status) = Command::new("kill")
+            .args(["-0", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+
+        if let Ok(status) = Command::new("ps")
+            .args(["-p", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            return status.success();
+        }
+
+        // Be conservative when we cannot determine process status.
+        return true;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Best effort: treat lock as active when process checks aren't available.
+        let _ = pid_str;
+        true
     }
 }
 
