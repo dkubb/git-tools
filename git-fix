@@ -96,6 +96,7 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CommitType {
     Fixup,
+    Amend,
     Squash,
     Pick,
     Revert,
@@ -105,6 +106,9 @@ impl CommitType {
     fn parse_subject(subject: &str) -> (CommitType, Option<&str>) {
         if let Some(rest) = subject.strip_prefix("fixup! ") {
             return (CommitType::Fixup, Some(rest));
+        }
+        if let Some(rest) = subject.strip_prefix("amend! ") {
+            return (CommitType::Amend, Some(rest));
         }
         if let Some(rest) = subject.strip_prefix("squash! ") {
             return (CommitType::Squash, Some(rest));
@@ -132,6 +136,7 @@ impl std::fmt::Display for CommitType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CommitType::Fixup => f.write_str("fixup"),
+            CommitType::Amend => f.write_str("fixup -C"),
             CommitType::Squash => f.write_str("squash"),
             CommitType::Pick => f.write_str("pick"),
             CommitType::Revert => f.write_str("revert"),
@@ -561,7 +566,7 @@ fn resolve_fixup_target(target_subject: &str, _commits: &[Commit]) -> String {
         // Check if current target is itself a fixup/squash commit
         let (commit_type, inner_target) = CommitType::parse_subject(current);
         match commit_type {
-            CommitType::Fixup | CommitType::Squash => {
+            CommitType::Fixup | CommitType::Amend | CommitType::Squash => {
                 if let Some(inner) = inner_target {
                     current = inner;
                 } else {
