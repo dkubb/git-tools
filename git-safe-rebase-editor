@@ -1,0 +1,1564 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [package]
+//! edition = "2024"
+//!
+//! [dependencies]
+//! clap = { version = "4.5.50", features = ["derive"] }
+//! thiserror = "2.0.17"
+//! shell-quote = "0.7.2"
+//! ```
+//!
+//! Parse, validate, and rewrite git rebase todo files while enforcing safety guarantees.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![deny(clippy::nursery)]
+#![allow(unfulfilled_lint_expectations, reason = "#[expect] attributes silence curated restriction exceptions")]
+#![deny(clippy::cargo)]
+#![deny(clippy::complexity)]
+#![deny(clippy::correctness)]
+#![deny(clippy::perf)]
+#![deny(clippy::style)]
+#![deny(clippy::suspicious)]
+#![expect(
+    clippy::blanket_clippy_restriction_lints,
+    reason = "Required to enable the clippy::restriction lint group"
+)]
+#![deny(clippy::restriction)]
+#![deny(
+    clippy::exhaustive_enums,
+    reason = "force all enums to use allow(clippy::exhaustive_enums)"
+)]
+#![deny(
+    clippy::exhaustive_structs,
+    reason = "force all structs to use allow(clippy::exhaustive_structs)"
+)]
+#![expect(
+    clippy::implicit_return,
+    reason = "Implicit returns keep pattern matching readable despite restriction lint"
+)]
+#![expect(
+    clippy::question_mark_used,
+    reason = "The `?` operator keeps error propagation concise in this CLI"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "CLI script reports user-facing messages directly to stdout"
+)]
+#![expect(
+    clippy::print_stderr,
+    reason = "CLI script reports diagnostics directly to stderr"
+)]
+#![expect(
+    clippy::pattern_type_mismatch,
+    reason = "Matching on references avoids unnecessary cloning for todo structures"
+)]
+#![expect(
+    clippy::cargo_common_metadata,
+    reason = "rust-script generates ephemeral packages without publishing metadata"
+)]
+
+use clap::{Parser, ValueEnum};
+use core::time::Duration;
+use shell_quote::{Bash, Quote as _};
+use std::env;
+use std::fs::{self, File};
+use std::io::{Error as IoError, ErrorKind, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, Stdio};
+use std::time::SystemTime;
+use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
+/// Success exit code
+const EXIT_OK: i32 = 0;
+/// Invalid arguments exit code
+const EXIT_USAGE: i32 = 64;
+/// Bad input or invalid git state exit code
+const EXIT_DATAERR: i32 = 65;
+/// Internal failure exit code
+const EXIT_SOFTWARE: i32 = 70;
+/// Grace period before considering lock stale
+const LOCK_STALE_GRACE: Duration = Duration::from_secs(60);
+
+/// Policy for wrapping exec commands in rebase todo
+#[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ExecPolicy {
+    /// Always wrap exec commands
+    Always,
+    /// Only wrap exec if todo has changes
+    Nonempty,
+}
+
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Parse errors intentionally enumerate every concrete failure mode"
+)]
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("todo parse error L{line}: {message}")]
+    WithLine { line: usize, message: String },
+}
+
+/// Git commit SHA hash with variable length (4-64 hex chars)
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "Struct exposes the full git object metadata used elsewhere"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObjectId {
+    /// SHA hash string
+    id: String,
+    /// Original length of the hash
+    length: usize,
+}
+
+/// Fixup command option for commit message handling
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum mirrors git fixup flag variants and is intentionally closed"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FixupOption {
+    /// Use commit message from specified commit (-C)
+    Amend(GitObjectId),
+    /// Discard commit message
+    Discard(GitObjectId),
+    /// Edit commit message from specified commit (-c)
+    Reword(GitObjectId),
+}
+
+/// Merge command option for commit message handling
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum mirrors git merge todo options and stays fixed"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeOption {
+    /// Use commit message from specified commit (-C)
+    Amend(GitObjectId),
+    /// Generate default merge message
+    Generate,
+    /// Edit commit message from specified commit (-c)
+    Reword(GitObjectId),
+}
+
+/// Git rebase command data (parsed from todo line)
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum covers every git rebase todo command we support"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandData {
+    /// Pause rebase for manual intervention
+    Break,
+    /// Apply commit with specified action
+    Commit {
+        /// Commit hash
+        commit: GitObjectId,
+        /// Commit message summary
+        summary: String,
+        /// Action to perform (pick, edit, etc.)
+        action: CommitAction,
+    },
+    /// Execute shell command
+    Exec {
+        /// Command string
+        command: String,
+    },
+    /// Fixup commit (combine with previous)
+    Fixup {
+        /// Message handling option
+        option: FixupOption,
+        /// Commit summary
+        summary: String,
+    },
+    /// Create label at current HEAD
+    Label {
+        /// Label name
+        label: String,
+    },
+    /// Merge commits
+    Merge {
+        /// Message handling option
+        option: MergeOption,
+        /// Branch label
+        label: String,
+    },
+    /// No operation
+    Noop,
+    /// Reset HEAD to label
+    Reset {
+        /// Label name
+        label: String,
+    },
+    /// Update ref to current HEAD
+    UpdateRef {
+        /// Reference name
+        reference: String,
+    },
+}
+
+/// Action to perform on a commit during rebase
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum matches git commit actions and is stable"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitAction {
+    /// Remove commit
+    Drop,
+    /// Apply commit and pause for amending
+    Edit,
+    /// Combine with previous, discard message
+    Fixup,
+    /// Apply commit as-is
+    Pick,
+    /// Apply commit and edit message
+    Reword,
+    /// Combine with previous commit
+    Squash,
+}
+
+/// Parsed rebase todo command line
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "Struct intentionally exposes parsed todo command components"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandLine {
+
+    /// Command data
+    pub data: CommandData,
+    /// Command keyword
+    pub keyword: Keyword,
+    /// Line number in todo file
+    pub line_no: usize,
+}
+
+/// Rebase command keyword (e.g., "pick", "p", "edit")
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "Struct holds parsed keyword metadata; all fields are intentional"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Keyword {
+    /// Keyword type
+    kind: KeywordKind,
+}
+
+/// Type of rebase command keyword
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum maps directly to git todo keywords; exhaustive by design"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeywordKind {
+    /// Break (pause rebase)
+    Break,
+    /// Commit with action
+    Commit(CommitAction),
+    /// Execute command
+    Exec,
+    /// Fixup commit
+    Fixup,
+    /// Create label
+    Label,
+    /// Merge commits
+    Merge,
+    /// No operation
+    Noop,
+    /// Reset to label
+    Reset,
+    /// Update reference
+    UpdateRef,
+}
+
+/// Single line in rebase todo file
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "Enum encodes todo line variants without future expansion"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TodoLine {
+    /// Command line with keyword and data
+    Command(CommandLine),
+}
+
+impl TodoLine {
+    /// # Errors
+    /// Returns an error if the todo line has invalid command syntax
+    pub fn parse(raw: &str, line_no: usize) -> Result<Option<Self>, ParseError> {
+        let leading_len = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+        #[expect(
+            clippy::string_slice,
+            reason = "Git todo syntax is ASCII-only, so byte slicing is safe here"
+        )]
+        let trimmed = raw.get(leading_len..).unwrap_or("").trim_end_matches('\r');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.starts_with('#') {
+            return Ok(None);
+        }
+        #[expect(
+            clippy::string_slice,
+            reason = "Git todo syntax is ASCII-only, so byte slicing is safe here"
+        )]
+        let leading = raw.get(..leading_len).unwrap_or("").to_owned();
+        let command = CommandLine::parse(leading, trimmed, line_no)?;
+        Ok(Some(Self::Command(command)))
+    }
+
+    /// Renders todo line back to text format
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Command(command) => command.render(),
+        }
+    }
+}
+
+/// Complete rebase todo file with parsed commands
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "Struct intentionally keeps parsed todo lines exhaustive"
+)]
+pub struct TodoFile {
+    /// Parsed command lines
+    lines: Vec<TodoLine>,
+}
+
+/// Command-line interface configuration
+#[derive(Parser)]
+#[command(bin_name = "git-safe-rebase-editor", disable_help_subcommand = true)]
+struct Cli {
+    /// Enable dry-run mode without modifying files
+    #[arg(long = "dry-mode")]
+    dry_mode: bool,
+
+    /// Policy for wrapping exec commands
+    #[arg(long = "exec-policy", value_enum, default_value_t = ExecPolicy::Nonempty)]
+    exec_policy: ExecPolicy,
+
+    /// Enable finish mode for empty commits
+    #[arg(long = "finish")]
+    finish: bool,
+
+    /// Explicit sequence editor to invoke inside the wrapper
+    #[arg(long = "sequence-editor")]
+    sequence_editor: Option<String>,
+
+    /// Path to git rebase todo file
+    #[arg(value_name = "TODO_PATH")]
+    todo_path: PathBuf,
+}
+
+/// Classification of parsed line types
+enum LineKind {
+    /// Blank line
+    Blank,
+    /// Command line with keyword and arguments
+    Command {
+        /// Command keyword
+        cmd: String,
+        /// Remaining arguments
+        rest: String,
+    },
+    /// Comment line starting with #
+    Comment,
+}
+
+/// RAII guard for exclusive lock on rebase todo file
+struct LockGuard {
+    /// Lock directory path
+    path: PathBuf,
+    /// PID file path for staleness detection
+    pid_path: PathBuf,
+    /// Temporary todo file path for editing
+    tmp_path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        drop(fs::remove_file(&self.pid_path));
+        drop(fs::remove_file(&self.tmp_path));
+        drop(fs::remove_dir_all(&self.path));
+    }
+}
+
+/// Parsed todo line with whitespace and classification
+struct ParsedLine {
+    /// Line classification
+    kind: LineKind,
+    /// Leading whitespace
+    leading: String,
+    /// Full line text
+    text: String,
+}
+
+impl Default for TodoFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TodoFile {
+    /// Returns slice of parsed todo lines
+    #[must_use]
+    pub fn lines(&self) -> &[TodoLine] {
+        &self.lines
+    }
+
+    /// Creates empty todo file
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { lines: Vec::new() }
+    }
+
+    /// # Errors
+    /// Returns an error if any todo line has invalid syntax or if noop is mixed with other commands
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        let mut lines = Vec::new();
+
+        for (idx, raw) in input.lines().enumerate() {
+            if let Some(line) = TodoLine::parse(raw, idx.saturating_add(1))? {
+                lines.push(line);
+            }
+        }
+
+        // Enforce Git's rule: a todo file containing `noop` must contain no other commands.
+        let mut saw_noop_line = None;
+        let mut saw_other_command = false;
+        for line in &lines {
+            match line {
+                TodoLine::Command(command) => {
+                    if command.data == CommandData::Noop {
+                        if saw_other_command {
+                            return Err(ParseError::WithLine {
+                                line: command.line_no,
+                                message: "noop command must be the only command in todo".to_owned(),
+                            });
+                        }
+                        saw_noop_line = Some(command.line_no);
+                    } else if saw_noop_line.is_some() {
+                        return Err(ParseError::WithLine {
+                            line: command.line_no,
+                            message: "noop command must be the only command in todo".to_owned(),
+                        });
+                    } else {
+                        saw_other_command = true;
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            return Err(ParseError::WithLine {
+                line: 1,
+                message: "no actionable commands found".to_owned(),
+            });
+        }
+
+        Ok(Self { lines })
+    }
+
+    /// Renders todo file back to text format
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for (idx, line) in self.lines.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(&line.render());
+        }
+        out
+    }
+}
+
+impl CommandLine {
+    /// # Errors
+    /// Returns an error if the command line has invalid syntax
+    pub fn parse(_leading: String, trimmed: &str, line_no: usize) -> Result<Self, ParseError> {
+        let (keyword_raw, rest) = split_keyword(trimmed).ok_or_else(|| ParseError::WithLine {
+            line: line_no,
+            message: String::from("missing keyword"),
+        })?;
+
+        let keyword = Keyword::parse(keyword_raw, line_no)?;
+        let data = match keyword.kind {
+            KeywordKind::Break => parse_break(rest, line_no)?,
+            KeywordKind::Commit(action) => parse_commit(rest, line_no, action)?,
+            KeywordKind::Exec => parse_exec(rest, line_no)?,
+            KeywordKind::Fixup => parse_fixup(rest, line_no)?,
+            KeywordKind::Label => parse_label(rest, line_no)?,
+            KeywordKind::Merge => parse_merge(rest, line_no)?,
+            KeywordKind::Noop => parse_noop(rest, line_no)?,
+            KeywordKind::Reset => parse_reset(rest, line_no)?,
+            KeywordKind::UpdateRef => parse_update_ref(rest, line_no)?,
+        };
+
+        Ok(Self {
+            data,
+            keyword,
+            line_no,
+        })
+    }
+
+    /// Renders command line back to text format
+    #[must_use]
+    pub fn render(&self) -> String {
+        match &self.data {
+            CommandData::Break | CommandData::Noop => self.keyword.canonical().to_owned(),
+            CommandData::Commit {
+                commit, summary, ..
+            } => {
+                format!(
+                    "{} {} {}",
+                    self.keyword.canonical(),
+                    commit.as_str(),
+                    summary
+                )
+            }
+            CommandData::Exec { command } => {
+                format!("{} {}", self.keyword.canonical(), command)
+            }
+            CommandData::Fixup { option, summary } => match option {
+                FixupOption::Amend(commit) => {
+                    format!(
+                        "{} -C {} {}",
+                        self.keyword.canonical(),
+                        commit.as_str(),
+                        summary
+                    )
+                }
+                FixupOption::Reword(commit) => {
+                    format!(
+                        "{} -c {} {}",
+                        self.keyword.canonical(),
+                        commit.as_str(),
+                        summary
+                    )
+                }
+                FixupOption::Discard(commit) => {
+                    format!(
+                        "{} {} {}",
+                        self.keyword.canonical(),
+                        commit.as_str(),
+                        summary
+                    )
+                }
+            },
+            CommandData::Merge { option, label } => match option {
+                MergeOption::Generate => {
+                    format!("{} {}", self.keyword.canonical(), label)
+                }
+                MergeOption::Amend(commit) => {
+                    format!(
+                        "{} -C {} {}",
+                        self.keyword.canonical(),
+                        commit.as_str(),
+                        label
+                    )
+                }
+                MergeOption::Reword(commit) => {
+                    format!(
+                        "{} -c {} {}",
+                        self.keyword.canonical(),
+                        commit.as_str(),
+                        label
+                    )
+                }
+            },
+            CommandData::Label { label } | CommandData::Reset { label } => {
+                format!("{} {}", self.keyword.canonical(), label)
+            }
+            CommandData::UpdateRef { reference } => {
+                format!("{} {}", self.keyword.canonical(), reference)
+            }
+        }
+    }
+}
+
+impl Keyword {
+    /// Returns canonical keyword string for rendering
+    const fn canonical(self) -> &'static str {
+        match self.kind {
+            KeywordKind::Break => "break",
+            KeywordKind::Commit(CommitAction::Pick) => "pick",
+            KeywordKind::Commit(CommitAction::Drop) => "drop",
+            KeywordKind::Commit(CommitAction::Edit) => "edit",
+            KeywordKind::Commit(CommitAction::Reword) => "reword",
+            KeywordKind::Commit(CommitAction::Squash) => "squash",
+            KeywordKind::Commit(CommitAction::Fixup) | KeywordKind::Fixup => "fixup",
+            KeywordKind::Exec => "exec",
+            KeywordKind::Label => "label",
+            KeywordKind::Merge => "merge",
+            KeywordKind::Noop => "noop",
+            KeywordKind::Reset => "reset",
+            KeywordKind::UpdateRef => "update-ref",
+        }
+    }
+
+    /// Parses keyword string into Keyword enum
+    #[expect(
+        clippy::single_call_fn,
+        reason = "Keyword parser isolates case folding logic for clarity"
+    )]
+    fn parse(keyword: &str, line_no: usize) -> Result<Self, ParseError> {
+        let kind = match keyword.to_lowercase().as_str() {
+            "b" | "break" => KeywordKind::Break,
+            "p" | "pick" => KeywordKind::Commit(CommitAction::Pick),
+            "d" | "drop" => KeywordKind::Commit(CommitAction::Drop),
+            "e" | "edit" => KeywordKind::Commit(CommitAction::Edit),
+            "r" | "reword" => KeywordKind::Commit(CommitAction::Reword),
+            "s" | "squash" => KeywordKind::Commit(CommitAction::Squash),
+            "f" | "fixup" => KeywordKind::Fixup,
+            "x" | "exec" => KeywordKind::Exec,
+            "l" | "label" => KeywordKind::Label,
+            "m" | "merge" => KeywordKind::Merge,
+            "noop" => KeywordKind::Noop,
+            "t" | "reset" => KeywordKind::Reset,
+            "u" | "update-ref" => KeywordKind::UpdateRef,
+            other => {
+                return Err(ParseError::WithLine {
+                    line: line_no,
+                    message: format!("invalid todo command keyword '{other}'"),
+                });
+            }
+        };
+
+        Ok(Self { kind })
+    }
+}
+
+impl GitObjectId {
+    /// Returns commit hash as string slice
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.id
+    }
+
+    /// # Errors
+    /// Returns an error if the commit object id is invalid (wrong length or non-hex characters)
+    pub fn new(id: &str, length: usize) -> Result<Self, ParseError> {
+        let len = id.len();
+        if !(4..=64).contains(&len) {
+            return Err(ParseError::WithLine {
+                line: 1,
+                message: format!("invalid commit object id length: {len}"),
+            });
+        }
+
+        if !id.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(ParseError::WithLine {
+                line: 1,
+                message: format!("invalid commit object id: {id}"),
+            });
+        }
+
+        Ok(Self {
+            id: id.to_owned(),
+            length,
+        })
+    }
+}
+
+/// Acquires exclusive lock on todo file to prevent concurrent edits
+#[expect(
+    clippy::create_dir,
+    reason = "Lock directory creation must fail atomically when the lock exists"
+)]
+#[expect(
+    clippy::single_call_fn,
+    reason = "Lock acquisition helper centralizes concurrency control despite one caller"
+)]
+fn acquire_lock(todo_path: &Path) -> Result<LockGuard, (i32, String)> {
+    let dir = todo_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("git-rebase-todo.lock");
+    let tmp_path = dir.join("git-rebase-todo");
+    let pid_path = dir.join("pid");
+
+    loop {
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    if let Err(err) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+                        drop(fs::remove_dir_all(&dir));
+                        return Err((
+                            EXIT_SOFTWARE,
+                            format!("failed to secure lock directory: {err}"),
+                        ));
+                    }
+                }
+
+                if let Err(err) = write_lock_metadata(&pid_path) {
+                    drop(fs::remove_dir_all(&dir));
+                    return Err(err);
+                }
+
+                return Ok(LockGuard {
+                    path: dir,
+                    pid_path,
+                    tmp_path,
+                });
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if lock_is_stale(&pid_path)? {
+                    if let Err(remove_err) = fs::remove_dir_all(&dir)
+                        && remove_err.kind() != ErrorKind::NotFound
+                    {
+                        return Err((
+                            EXIT_SOFTWARE,
+                            format!("failed to clear stale lock: {remove_err}"),
+                        ));
+                    }
+                } else {
+                    return Err((
+                        EXIT_SOFTWARE,
+                        "another git-safe-rebase-editor instance is running".to_owned(),
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err((
+                    EXIT_SOFTWARE,
+                    format!("failed to create lock directory: {err}"),
+                ));
+            }
+        }
+    }
+}
+
+/// Generates preview string of editor command for dry-run
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper produces human-readable preview even if only used during dry-run"
+)]
+fn editor_preview(tmp_path: &Path, sequence_editor: Option<&str>) -> String {
+    resolve_editor(tmp_path, sequence_editor).join(" ")
+}
+
+/// Verifies current directory is inside a git repository
+#[expect(
+    clippy::single_call_fn,
+    reason = "Utility isolates git probe even though called from one path"
+)]
+fn ensure_git_repo() -> Result<(), (i32, String)> {
+    let status = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| (EXIT_SOFTWARE, format!("failed to detect git repo: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err((EXIT_DATAERR, "not a git repo".to_owned()))
+    }
+}
+
+/// Verifies todo file exists and is writable
+#[expect(
+    clippy::single_call_fn,
+    reason = "File validation stays readable even though run() is sole caller"
+)]
+fn ensure_writable(path: &Path) -> Result<(), (i32, String)> {
+    if !path.exists() {
+        return Err((
+            EXIT_DATAERR,
+            format!("todo file not found: {}", path.display()),
+        ));
+    }
+    if !path.is_file() {
+        return Err((
+            EXIT_DATAERR,
+            format!("todo path is not a file: {}", path.display()),
+        ));
+    }
+    File::options()
+        .write(true)
+        .open(path)
+        .map_err(|error| (EXIT_DATAERR, format!("todo file not writable: {error}")))?;
+    Ok(())
+}
+
+/// Checks if commit has no tree changes (empty commit)
+/// Returns true if commit is empty (no changes), false if commit has changes
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper checks commit contents even though only invoked during finish handling"
+)]
+fn is_empty_commit(sha: &str) -> Result<bool, (i32, String)> {
+    let status = Command::new("git")
+        .arg("diff-tree")
+        .arg("--no-commit-id")
+        .arg("-r")
+        .arg("--exit-code")
+        .arg(sha)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| (EXIT_SOFTWARE, format!("git diff-tree failed: {error}")))?;
+    Ok(status.success())
+}
+
+/// Launches editor to allow user to modify todo file
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper centralizes editor spawning even though only rewrite_todo() uses it"
+)]
+fn launch_editor(cmd: &[String]) -> Result<(), (i32, String)> {
+    if cmd.is_empty() {
+        return Ok(());
+    }
+    let mut iter = cmd.iter();
+    let Some(program) = iter.next() else {
+        return Err((EXIT_SOFTWARE, "editor command missing program".to_owned()));
+    };
+    let mut command = Command::new(program);
+    for arg in iter {
+        command.arg(arg);
+    }
+    let status = command.status().map_err(|error| {
+        (
+            EXIT_SOFTWARE,
+            format!("failed to launch editor {program}: {error}"),
+        )
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err((EXIT_SOFTWARE, "editor: aborted or failed".to_owned()))
+    }
+}
+
+/// Checks if lock is stale by examining PID file and directory age
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper encapsulates stale-lock heuristics despite single caller"
+)]
+#[expect(
+    clippy::verbose_file_reads,
+    reason = "Need explicit File handle to attach contextual error messages"
+)]
+fn lock_is_stale(pid_path: &Path) -> Result<bool, (i32, String)> {
+    let lock_age = lock_dir_age(pid_path);
+
+    let mut buf = String::new();
+    match File::open(pid_path) {
+        Ok(mut file) => {
+            file.read_to_string(&mut buf).map_err(|error| {
+                (
+                    EXIT_SOFTWARE,
+                    format!("failed to read lock metadata: {error}"),
+                )
+            })?;
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            // PID file missing - could be mid-creation or abandoned lock.
+            // Check lock directory age: if > LOCK_STALE_GRACE, assume crashed during creation.
+            // If fresh, another process may still be writing the PID file.
+            return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE));
+        }
+        Err(err) => {
+            return Err((
+                EXIT_SOFTWARE,
+                format!("failed to inspect lock metadata: {err}"),
+            ));
+        }
+    }
+
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE));
+    }
+
+    let pid: i32 = match trimmed.parse() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE)),
+    };
+
+    if pid_is_running(pid) {
+        return Ok(false);
+    }
+
+    Ok(lock_age.is_some_and(|age| age > LOCK_STALE_GRACE))
+}
+
+fn lock_dir_age(pid_path: &Path) -> Option<Duration> {
+    let parent = pid_path.parent().unwrap_or_else(|| Path::new("."));
+    let meta = fs::metadata(parent).ok()?;
+    let modified = meta.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+fn pid_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let pid_str = pid.to_string();
+
+    #[cfg(unix)]
+    {
+        if let Ok(status) = Command::new("kill")
+            .args(["-0", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+
+        if let Ok(status) = Command::new("ps")
+            .args(["-p", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            return status.success();
+        }
+
+        // Be conservative when we cannot determine process status.
+        return true;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Best effort: treat lock as active when process checks aren't available.
+        let _ = pid_str;
+        true
+    }
+}
+
+/// Entry point - runs editor and exits with appropriate code
+fn main() {
+    match run() {
+        Ok(code) => process::exit(code),
+        Err((code, message)) => {
+            eprintln!("{message}");
+            process::exit(code);
+        }
+    }
+}
+
+/// Parses break command (expects no arguments)
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps command-specific logic isolated even when referenced once"
+)]
+fn parse_break(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    if !rest.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: String::from("break command does not take arguments"),
+        });
+    }
+    Ok(CommandData::Break)
+}
+
+/// Parses command line arguments into CLI config
+#[expect(
+    clippy::single_call_fn,
+    reason = "CLI builder isolates Clap parsing even with a single caller"
+)]
+fn parse_cli() -> Result<Cli, (i32, String)> {
+    Cli::try_parse().map_err(|err| (EXIT_USAGE, err.to_string()))
+}
+
+/// Parses commit command with SHA and summary
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps commit handling encapsulated despite one dispatch site"
+)]
+fn parse_commit(
+    rest: &str,
+    line_no: usize,
+    action: CommitAction,
+) -> Result<CommandData, ParseError> {
+    let (commit_str, summary) = take_token(rest).ok_or_else(|| ParseError::WithLine {
+        line: line_no,
+        message: format!("missing commit for {}", "commit command"),
+    })?;
+
+    let commit = GitObjectId::new(commit_str, line_no)?;
+    let trimmed_summary = summary.trim_start().to_owned();
+
+    Ok(CommandData::Commit {
+        commit,
+        summary: trimmed_summary,
+        action,
+    })
+}
+
+/// Parses exec command with shell command string
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps exec handling isolated even though there is one match arm"
+)]
+fn parse_exec(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let command = rest.trim_start().to_owned();
+    if command.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: String::from("missing command for exec"),
+        });
+    }
+    Ok(CommandData::Exec { command })
+}
+
+/// Helper for parsing commands with -C/-c flags and commit+summary pattern
+fn parse_commit_with_flags(
+    rest: &str,
+    line_no: usize,
+    error_msg: &str,
+) -> Result<(GitObjectId, String), ParseError> {
+    let (commit_str, summary) = take_token(rest).ok_or_else(|| ParseError::WithLine {
+        line: line_no,
+        message: error_msg.to_owned(),
+    })?;
+    let commit = GitObjectId::new(commit_str, line_no)?;
+    Ok((commit, summary.trim_start().to_owned()))
+}
+
+/// Parses fixup command with optional -C/-c flags
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps fixup handling localized despite a single dispatch path"
+)]
+fn parse_fixup(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let trimmed = rest.trim_start();
+
+    if let Some(stripped) = trimmed.strip_prefix("-C") {
+        let (commit, summary) = parse_commit_with_flags(
+            stripped.trim_start(),
+            line_no,
+            "missing fixup option commit",
+        )?;
+        Ok(CommandData::Fixup {
+            option: FixupOption::Amend(commit),
+            summary,
+        })
+    } else if let Some(stripped) = trimmed.strip_prefix("-c") {
+        let (commit, summary) = parse_commit_with_flags(
+            stripped.trim_start(),
+            line_no,
+            "missing fixup option commit",
+        )?;
+        Ok(CommandData::Fixup {
+            option: FixupOption::Reword(commit),
+            summary,
+        })
+    } else {
+        let (commit, summary) =
+            parse_commit_with_flags(rest, line_no, "missing fixup target for todo command")?;
+        Ok(CommandData::Fixup {
+            option: FixupOption::Discard(commit),
+            summary,
+        })
+    }
+}
+
+/// Parses label command with label name
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps label handling tidy despite a single caller"
+)]
+fn parse_label(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let label = rest.trim_start();
+    if label.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: "missing label for todo command".to_owned(),
+        });
+    }
+    Ok(CommandData::Label {
+        label: label.to_owned(),
+    })
+}
+
+/// Parses raw lines into structured `ParsedLine` objects
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper converts raw todo text once per invocation for clarity"
+)]
+fn parse_lines(lines: &[String]) -> Vec<ParsedLine> {
+    lines
+        .iter()
+        .map(|line| {
+            let leading = line
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .collect::<String>();
+            let trimmed = line.trim_start();
+            let kind = if trimmed.is_empty() {
+                LineKind::Blank
+            } else if trimmed.starts_with('#') {
+                LineKind::Comment
+            } else {
+                let (cmd, rest) = split_command(trimmed);
+                LineKind::Command { cmd, rest }
+            };
+            ParsedLine {
+                leading,
+                text: line.clone(),
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Helper for validating non-empty label
+fn validate_label(label: &str, line_no: usize) -> Result<String, ParseError> {
+    let trimmed = label.trim_start();
+    if trimmed.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: "missing merge label".to_owned(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Parses merge command with optional -C/-c flags and label
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps merge variants isolated even though only one pathway uses it"
+)]
+fn parse_merge(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let trimmed = rest.trim_start();
+
+    if let Some(stripped) = trimmed.strip_prefix("-C") {
+        let remaining = stripped.trim_start();
+        let (commit, label) = parse_commit_with_flags(remaining, line_no, "missing merge commit")?;
+        let label_clean = validate_label(&label, line_no)?;
+        Ok(CommandData::Merge {
+            option: MergeOption::Amend(commit),
+            label: label_clean,
+        })
+    } else if let Some(stripped) = trimmed.strip_prefix("-c") {
+        let remaining = stripped.trim_start();
+        let (commit, label) = parse_commit_with_flags(remaining, line_no, "missing merge commit")?;
+        let label_clean = validate_label(&label, line_no)?;
+        Ok(CommandData::Merge {
+            option: MergeOption::Reword(commit),
+            label: label_clean,
+        })
+    } else {
+        let label_clean = validate_label(trimmed, line_no)?;
+        Ok(CommandData::Merge {
+            option: MergeOption::Generate,
+            label: label_clean,
+        })
+    }
+}
+
+/// Parses noop command (expects no arguments)
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps noop logic explicit even with a single caller"
+)]
+fn parse_noop(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    if !rest.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: "noop command must not have arguments".to_owned(),
+        });
+    }
+    Ok(CommandData::Noop)
+}
+
+/// Parses reset command with label to reset to
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps reset handling isolated despite a single match arm"
+)]
+fn parse_reset(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let label = rest.trim_start();
+    if label.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: "missing reset label for todo command".to_owned(),
+        });
+    }
+    Ok(CommandData::Reset {
+        label: label.to_owned(),
+    })
+}
+
+/// Parses update-ref command with reference name
+#[expect(
+    clippy::single_call_fn,
+    reason = "Parser keeps update-ref handling self-contained even with one caller"
+)]
+fn parse_update_ref(rest: &str, line_no: usize) -> Result<CommandData, ParseError> {
+    let reference = rest.trim_start();
+    if reference.is_empty() {
+        return Err(ParseError::WithLine {
+            line: line_no,
+            message: "missing update-ref".to_owned(),
+        });
+    }
+    Ok(CommandData::UpdateRef {
+        reference: reference.to_owned(),
+    })
+}
+
+/// Reads file contents as vector of lines
+fn read_lines(path: &Path) -> Result<Vec<String>, (i32, String)> {
+    let mut buf = String::new();
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "Need to customize error wrapping while reusing buffer"
+    )]
+    File::open(path)
+        .map_err(|error| {
+            (
+                EXIT_SOFTWARE,
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?
+        .read_to_string(&mut buf)
+        .map_err(|error| {
+            (
+                EXIT_SOFTWARE,
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
+    Ok(buf.lines().map(ToString::to_string).collect())
+}
+
+/// Resolves editor command from `EDITOR` or `GIT_EDITOR`
+fn resolve_editor(tmp_path: &Path, sequence_editor: Option<&str>) -> Vec<String> {
+    let build_editor_cmd = |editor: &str| {
+        let mut parts: Vec<String> = editor.split_whitespace().map(ToString::to_string).collect();
+        if parts.is_empty() {
+            parts.push("cat".into());
+        }
+        parts.push(tmp_path.display().to_string());
+        parts
+    };
+
+    if let Some(editor) = sequence_editor
+        && !editor.trim().is_empty()
+    {
+        return build_editor_cmd(editor);
+    }
+
+    if let Ok(editor) = env::var("EDITOR")
+        && !editor.trim().is_empty()
+    {
+        return build_editor_cmd(&editor);
+    }
+
+    if let Ok(out) = Command::new("git").arg("var").arg("GIT_EDITOR").output()
+        && out.status.success()
+    {
+        let editor = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !editor.is_empty() {
+            return build_editor_cmd(&editor);
+        }
+    }
+
+    build_editor_cmd("cat")
+}
+
+/// Rewrites todo lines to wrap exec commands with safe-rebase-exec
+#[expect(
+    clippy::single_call_fn,
+    reason = "Coordinator applies wrapping rules in one place despite single caller"
+)]
+fn rewrite_todo(
+    parsed: &[ParsedLine],
+    saw_exec: bool,
+    preflight_cmd: &str,
+    exec_prefix: &str,
+    policy: ExecPolicy,
+    finish_mode: bool,
+) -> Result<Vec<String>, (i32, String)> {
+    let mut output = Vec::new();
+
+    if saw_exec {
+        let quoted_cmd: String = Bash::quote(preflight_cmd);
+        output.push(format!(
+            "exec {exec_prefix} --phase preflight -- {quoted_cmd}"
+        ));
+    }
+
+    let mut prev_was_empty = false;
+
+    for line in parsed {
+        match &line.kind {
+            LineKind::Blank | LineKind::Comment => {
+                output.push(line.text.clone());
+            }
+            LineKind::Command { cmd, rest } => match cmd.as_str() {
+                "pick" | "reword" | "squash" | "fixup" | "fixup!" | "merge" | "edit" => {
+                    let sha = rest.split_whitespace().next().unwrap_or("");
+                    prev_was_empty = false;
+                    if finish_mode && !sha.is_empty() && is_empty_commit(sha)? {
+                        prev_was_empty = true;
+                        if cmd == "edit" {
+                            output.push(format!("{}pick {}", line.leading, rest));
+                            continue;
+                        }
+                    }
+                    output.push(line.text.clone());
+                }
+                "exec" | "x" => {
+                    let exec_command = rest.trim_start();
+                    if finish_mode && prev_was_empty {
+                        prev_was_empty = false;
+                        continue;
+                    }
+                    let mut wrapped = format!("exec {exec_prefix} --phase post-apply");
+                    if policy == ExecPolicy::Nonempty {
+                        wrapped.push_str(" --skip-if-empty");
+                    }
+                    wrapped.push_str(" -- ");
+                    let quoted_cmd: String = Bash::quote(exec_command);
+                    wrapped.push_str(&quoted_cmd);
+                    output.push(format!("{}{}", line.leading, wrapped));
+                }
+                _ => {
+                    prev_was_empty = false;
+                    output.push(line.text.clone());
+                }
+            },
+        }
+    }
+
+    Ok(output)
+}
+
+/// Main logic - validates todo, launches editor, rewrites commands
+#[expect(
+    clippy::single_call_fn,
+    reason = "Main routine stays encapsulated despite single entry point"
+)]
+fn run() -> Result<i32, (i32, String)> {
+    const EXEC_WRAPPER: &str = "git safe-rebase-exec";
+
+    let cfg = parse_cli()?;
+    ensure_git_repo()?;
+    ensure_writable(&cfg.todo_path)?;
+
+    let original_lines = read_lines(&cfg.todo_path)?;
+    validate_todo(&original_lines, cfg.finish)?;
+
+    let lock = acquire_lock(&cfg.todo_path)?;
+    fs::copy(&cfg.todo_path, &lock.tmp_path).map_err(|error| {
+        (
+            EXIT_SOFTWARE,
+            format!("failed to stage temporary todo: {error}"),
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        if let Err(err) = fs::set_permissions(&lock.tmp_path, fs::Permissions::from_mode(0o600)) {
+            return Err((
+                EXIT_SOFTWARE,
+                format!("failed to secure temporary todo: {err}"),
+            ));
+        }
+    }
+
+    let mut preflight_cmd = env::var("SAFE_REBASE_EXEC_COMMAND").unwrap_or_default();
+    let parsed = parse_lines(&original_lines);
+
+    if preflight_cmd.is_empty()
+        && let Some(cmd) = parsed.iter().find_map(|line| match &line.kind {
+            LineKind::Command { cmd, rest } if cmd == "exec" || cmd == "x" => {
+                Some(rest.trim_start().to_owned())
+            }
+            LineKind::Command { .. } | LineKind::Blank | LineKind::Comment => None,
+        })
+    {
+        preflight_cmd = cmd;
+    }
+
+    if preflight_cmd.trim().is_empty() {
+        "true".clone_into(&mut preflight_cmd);
+    }
+
+    let saw_exec = parsed.iter().any(
+        |line| matches!(&line.kind, LineKind::Command { cmd, .. } if cmd == "exec" || cmd == "x"),
+    );
+
+    let rewritten = rewrite_todo(
+        &parsed,
+        saw_exec,
+        &preflight_cmd,
+        EXEC_WRAPPER,
+        cfg.exec_policy,
+        cfg.finish,
+    )?;
+
+    if cfg.dry_mode {
+        println!("[dry] would rewrite todo as follows:");
+        println!("---");
+        for line in &rewritten {
+            println!("{line}");
+        }
+        println!("---");
+        let preview = editor_preview(&lock.tmp_path, cfg.sequence_editor.as_deref());
+        println!("[dry] would open editor: {preview}");
+        println!(
+            "[dry] would atomically replace \"{}\" with edited tmp",
+            cfg.todo_path.display()
+        );
+        return Ok(0);
+    }
+
+    write_lines(&lock.tmp_path, &rewritten)?;
+
+    let editor_cmd = resolve_editor(&lock.tmp_path, cfg.sequence_editor.as_deref());
+    launch_editor(&editor_cmd)?;
+
+    let post_lines = read_lines(&lock.tmp_path)?;
+    validate_todo(&post_lines, cfg.finish)?;
+
+    fs::rename(&lock.tmp_path, &cfg.todo_path).map_err(|error| {
+        (
+            EXIT_SOFTWARE,
+            format!("failed to install rewritten todo: {error}"),
+        )
+    })?;
+
+    drop(lock);
+    Ok(EXIT_OK)
+}
+
+/// Splits line into command and arguments
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper isolates command tokenization despite a single consumer"
+)]
+fn split_command(line: &str) -> (String, String) {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("").to_owned();
+    let rest = parts.next().unwrap_or("").trim_start().to_owned();
+    (cmd, rest)
+}
+
+/// Splits a command line into keyword and remaining text
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper makes keyword handling explicit even though only parse path uses it"
+)]
+fn split_keyword(input: &str) -> Option<(&str, &str)> {
+    let (keyword, mut rest) = take_token(input)?;
+    // Skip leading whitespace in the rest
+    rest = rest.trim_start_matches(char::is_whitespace);
+    Some((keyword, rest))
+}
+
+/// Extracts first whitespace-delimited token and remaining text
+fn take_token(input: &str) -> Option<(&str, &str)> {
+    let token_end = input
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(input.len(), |(idx, _)| idx);
+    #[expect(
+        clippy::string_slice,
+        reason = "Git todo syntax is ASCII-only, so token slicing by byte index is safe"
+    )]
+    let token = input.get(..token_end).unwrap_or("");
+    #[expect(
+        clippy::string_slice,
+        reason = "Git todo syntax is ASCII-only, so token slicing by byte index is safe"
+    )]
+    let rest = input.get(token_end..).unwrap_or("");
+    if token.is_empty() {
+        None
+    } else {
+        Some((token, rest))
+    }
+}
+
+/// Validates todo file syntax and structure
+fn validate_todo(lines: &[String], _finish: bool) -> Result<(), (i32, String)> {
+    let content = lines.join("\n");
+    match TodoFile::parse(&content) {
+        Ok(_) => {
+            // Parsing succeeded, basic validation passed
+            Ok(())
+        }
+        Err(err) => match err {
+            ParseError::WithLine { line, message } => Err((
+                EXIT_DATAERR,
+                format!("todo syntax error L{line}: {message}"),
+            )),
+        },
+    }
+}
+
+/// Helper for file operation errors
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper wraps IO errors with consistent context"
+)]
+fn file_error(operation: &str, path: &Path, error: &IoError) -> (i32, String) {
+    (
+        EXIT_SOFTWARE,
+        format!("failed to {operation} {}: {error}", path.display()),
+    )
+}
+
+/// Writes lines to file with newline terminators
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper centralizes file output even though rewrite_todo() is the only caller"
+)]
+fn write_lines(path: &Path, lines: &[String]) -> Result<(), (i32, String)> {
+    let mut file = File::create(path).map_err(|error| file_error("overwrite", path, &error))?;
+    for line in lines {
+        writeln!(file, "{line}")
+            .map_err(|error| (EXIT_SOFTWARE, format!("failed to write todo: {error}")))?;
+    }
+    Ok(())
+}
+
+/// Writes current process ID to lock metadata file
+#[expect(
+    clippy::single_call_fn,
+    reason = "Helper stores PID metadata even though acquire_lock() is sole caller"
+)]
+fn write_lock_metadata(pid_path: &Path) -> Result<(), (i32, String)> {
+    let mut file = File::create(pid_path).map_err(|error| {
+        (
+            EXIT_SOFTWARE,
+            format!("failed to create lock metadata: {error}"),
+        )
+    })?;
+    writeln!(file, "{}", process::id()).map_err(|error| {
+        (
+            EXIT_SOFTWARE,
+            format!("failed to write lock metadata: {error}"),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        if let Err(err) = fs::set_permissions(pid_path, fs::Permissions::from_mode(0o600)) {
+            return Err((
+                EXIT_SOFTWARE,
+                format!("failed to secure lock metadata: {err}"),
+            ));
+        }
+    }
+    Ok(())
+}
