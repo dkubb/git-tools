@@ -25,7 +25,6 @@ use thiserror::Error;
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 64;
 const EXIT_SOFTWARE: i32 = 70;
-const ACTION_MAX_LEN: usize = 70;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "lowercase")]
@@ -207,43 +206,15 @@ impl ActionList {
         let mut result = Vec::new();
         let text = action.to_string();
 
-        for paragraph in text.lines().filter(|line| !line.trim().is_empty()) {
-            let words: Vec<&str> = paragraph.split_whitespace().collect();
-            if words.is_empty() {
+        for raw_line in text.lines() {
+            let normalized = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.is_empty() {
                 continue;
             }
-
-            let mut current_line = String::new();
-
-            for word in words {
-                if current_line.is_empty() {
-                    current_line.push_str(word);
-                } else if current_line
-                    .len()
-                    .saturating_add(1)
-                    .saturating_add(word.len())
-                    <= ACTION_MAX_LEN
-                {
-                    current_line.push(' ');
-                    current_line.push_str(word);
-                } else {
-                    // Current line is full, push it and start a new line
-                    if result.is_empty() {
-                        result.push(format!("- {current_line}"));
-                    } else {
-                        result.push(format!("  {current_line}"));
-                    }
-                    word.clone_into(&mut current_line);
-                }
-            }
-
-            // Push the last line
-            if !current_line.is_empty() {
-                if result.is_empty() {
-                    result.push(format!("- {current_line}"));
-                } else {
-                    result.push(format!("  {current_line}"));
-                }
+            if result.is_empty() {
+                result.push(format!("- {normalized}"));
+            } else {
+                result.push(format!("  {normalized}"));
             }
         }
 
