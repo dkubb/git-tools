@@ -303,6 +303,39 @@ fn main() {
 
     let args = Args::parse();
 
+    if !args.allow_dirty {
+        match collect_unstaged_untracked() {
+            Ok((unstaged, untracked)) => {
+                if !unstaged.is_empty() || !untracked.is_empty() {
+                    eprintln!("✗ ERROR: Unstaged or untracked changes detected");
+                    eprintln!(
+                        "NEXT: Stage changes or rerun with --allow-dirty to allow committing with a dirty working tree"
+                    );
+
+                    if !unstaged.is_empty() {
+                        eprintln!("UNSTAGED:");
+                        for path in &unstaged {
+                            eprintln!("  - {}", path);
+                        }
+                    }
+
+                    if !untracked.is_empty() {
+                        eprintln!("UNTRACKED:");
+                        for path in &untracked {
+                            eprintln!("  - {}", path);
+                        }
+                    }
+
+                    exit(EXIT_USAGE);
+                }
+            }
+            Err(message) => {
+                eprintln!("✗ ERROR: {}", message);
+                exit(EXIT_SOFTWARE);
+            }
+        }
+    }
+
     let parsed_actions = args
         .actions
         .into_iter()
@@ -397,7 +430,7 @@ fn main() {
     commit_cmd
         .arg("commit");
     
-    if args.empty {
+    if args.empty || args.reword.is_some() {
         commit_cmd.arg("--allow-empty");
     }
 
@@ -457,4 +490,41 @@ fn main() {
     }
 
     println!("✓ Commit created successfully");
+}
+
+fn collect_unstaged_untracked() -> Result<(Vec<String>, Vec<String>), String> {
+    let unstaged_output = Command::new("git")
+        .args(&["diff", "--name-only"])
+        .output()
+        .map_err(|e| format!("Failed to execute git diff --name-only: {}", e))?;
+
+    if !unstaged_output.status.success() {
+        return Err("git diff --name-only failed".to_string());
+    }
+
+    let unstaged = String::from_utf8_lossy(&unstaged_output.stdout)
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+
+    let untracked_output = Command::new("git")
+        .args(&["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to execute git ls-files --others --exclude-standard: {}",
+                e
+            )
+        })?;
+
+    if !untracked_output.status.success() {
+        return Err("git ls-files --others --exclude-standard failed".to_string());
+    }
+
+    let untracked = String::from_utf8_lossy(&untracked_output.stdout)
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+
+    Ok((unstaged, untracked))
 }
