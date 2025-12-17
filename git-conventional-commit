@@ -211,11 +211,8 @@ impl ActionList {
             if normalized.is_empty() {
                 continue;
             }
-            if result.is_empty() {
-                result.push(format!("- {normalized}"));
-            } else {
-                result.push(format!("  {normalized}"));
-            }
+            let prefix = if result.is_empty() { "- " } else { "  " };
+            result.push(format!("{prefix}{normalized}"));
         }
 
         result
