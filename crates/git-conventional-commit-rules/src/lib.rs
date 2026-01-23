@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use thiserror::Error;
 
-const SUBJECT_MAX_LEN: usize = 50;
+const SUBJECT_MAX_LEN: usize = 70;
 const BODY_LINE_MAX_LEN: usize = 72;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -112,7 +112,7 @@ pub enum ValidationError {
     BodyLineTooLong { len: usize, line: String },
 
     #[error(
-        "Subject too long ({len} > 50).\nGiven current type/scope/bang, you have ~{budget} chars for --summary.\nSubject: {subject}"
+        "Subject too long ({len} > 70).\nGiven current type/scope/bang, you have ~{budget} chars for --summary.\nSubject: {subject}"
     )]
     SubjectTooLong {
         len: usize,
