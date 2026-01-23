@@ -5,7 +5,7 @@
 //! thiserror = "2.0.17"
 //! ```
 //!
-//! Fix branch commit data to be the same as author data
+//! Fix branch commit data to be the same as author data and normalize dates
 
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
@@ -72,9 +72,6 @@ use core::str::FromStr;
 use std::process::{Command, Stdio, exit};
 use thiserror::Error;
 
-/// Successful exit code
-const EXIT_OK: i32 = 0;
-
 /// Exit code for bad input / not found
 const EXIT_DATAERR: i32 = 65;
 
@@ -135,18 +132,22 @@ impl GitRef {
 /// Command line arguments for git-fix-branch
 #[derive(Parser, Debug)]
 #[command(name = "git-fix-branch")]
-#[command(about = "Fix branch commit data to be the same as author data", long_about = None)]
+#[command(about = "Fix branch commit data to be the same as author data and ensure monotonic dates", long_about = None)]
 struct Args {
     /// Show what would be done without making changes
     #[arg(long)]
     dry_run: bool,
 
-    /// Parent branch to rebase on
-    parent: Option<GitRef>,
-
     /// Rewrite the entire branch back to the repository root
     #[arg(long)]
     root: bool,
+
+    /// Branches to stack (each rebased on the previous)
+    ///
+    /// With 0 args: auto-detect parent, fix current branch
+    /// With 1 arg: use as parent, fix current branch
+    /// With 2+ args: stack mode, rebase each branch on the previous
+    branches: Vec<String>,
 }
 
 /// Range of commits to be processed
@@ -187,7 +188,7 @@ fn validate_git_ref(ref_name: &str) -> Result<String, ValidationError> {
 /// Main entry point for git-fix-branch
 fn main() {
     let Args {
-        parent,
+        branches,
         dry_run,
         root,
     } = Args::parse();
@@ -205,64 +206,208 @@ fn main() {
         exit(EXIT_DATAERR);
     }
 
-    if root && parent.is_some() {
-        eprintln!("✗ ERROR: --root cannot be used together with a parent reference.");
-        eprintln!("NEXT: Omit the parent argument when using --root.");
-        exit(EXIT_DATAERR);
-    }
-
-    // Get parent branch - use default if not provided
-    let resolved_parent = if root {
-        None
-    } else if let Some(parent_ref) = parent {
-        Some(parent_ref)
-    } else {
-        match resolve_default_branch() {
-            Ok(default_branch) => match GitRef::from_str(&default_branch) {
-                Ok(git_ref) => Some(git_ref),
-                Err(error) => {
-                    eprintln!("✗ ERROR: {error}");
-                    eprintln!(
-                        "NEXT: Provide --parent <branch> or fix the default branch configuration"
-                    );
-                    exit(EXIT_DATAERR);
-                }
-            },
-            Err(message) => {
-                eprintln!("✗ ERROR: {message}");
-                eprintln!("NEXT: Provide --parent <branch> or configure init.defaultBranch");
-                exit(EXIT_DATAERR);
+    // Determine the execution mode based on arguments
+    match branches.len() {
+        0 => {
+            // No branches: auto-detect parent, fix current branch
+            if root {
+                run_fix_branch(None, true, dry_run);
+            } else {
+                let parent = resolve_parent_or_exit();
+                run_fix_branch(Some(&parent), false, dry_run);
             }
         }
-    };
+        1 => {
+            // Single branch: use as parent, fix current branch
+            if root {
+                eprintln!("✗ ERROR: --root cannot be used with a single branch argument.");
+                eprintln!("NEXT: Either omit --root to use the branch as parent, or omit the branch to fix current branch from root.");
+                exit(EXIT_DATAERR);
+            }
+            let parent = validate_branch_or_exit(&branches[0]);
+            run_fix_branch(Some(&parent), false, dry_run);
+        }
+        _ => {
+            // Multiple branches: stack mode
+            run_stack_mode(&branches, root, dry_run);
+        }
+    }
+}
+
+/// Resolves the default parent branch or exits with an error
+fn resolve_parent_or_exit() -> GitRef {
+    match resolve_default_branch() {
+        Ok(default_branch) => match GitRef::from_str(&default_branch) {
+            Ok(git_ref) => git_ref,
+            Err(error) => {
+                eprintln!("✗ ERROR: {error}");
+                eprintln!("NEXT: Provide a parent branch or fix the default branch configuration");
+                exit(EXIT_DATAERR);
+            }
+        },
+        Err(message) => {
+            eprintln!("✗ ERROR: {message}");
+            eprintln!("NEXT: Provide a parent branch or configure init.defaultBranch");
+            exit(EXIT_DATAERR);
+        }
+    }
+}
+
+/// Validates a branch name and returns a GitRef or exits with an error
+fn validate_branch_or_exit(branch: &str) -> GitRef {
+    match GitRef::from_str(branch) {
+        Ok(git_ref) => git_ref,
+        Err(error) => {
+            eprintln!("✗ ERROR: {error}");
+            exit(EXIT_DATAERR);
+        }
+    }
+}
+
+/// Gets the current branch name or exits with an error
+fn get_current_branch_or_exit() -> String {
+    match git_output_optional(&["symbolic-ref", "--short", "HEAD"]) {
+        Some(branch) => branch,
+        None => {
+            // Might be in detached HEAD state, get the commit SHA
+            match git_output_optional(&["rev-parse", "--short", "HEAD"]) {
+                Some(sha) => sha,
+                None => {
+                    eprintln!("✗ ERROR: Unable to determine current branch or HEAD.");
+                    exit(EXIT_SOFTWARE);
+                }
+            }
+        }
+    }
+}
+
+/// Checks out a branch or exits with an error
+fn checkout_branch(branch: &str) {
+    println!("→ Checking out {branch}");
+    let status = Command::new("git")
+        .args(["checkout", branch])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => {
+            eprintln!("✗ ERROR: Failed to checkout branch: {branch}");
+            exit(EXIT_SOFTWARE);
+        }
+        Err(error) => {
+            eprintln!("✗ ERROR: Failed to execute git checkout");
+            eprintln!("DETAILS: {error}");
+            exit(EXIT_SOFTWARE);
+        }
+    }
+}
+
+/// Runs stack mode: rebase each branch on the previous one
+fn run_stack_mode(branches: &[String], root: bool, dry_run: bool) {
+    // Validate all branches exist upfront (for early error detection)
+    for branch in branches {
+        validate_branch_or_exit(branch);
+    }
+
+    // Save the original branch to return to later
+    let original_branch = get_current_branch_or_exit();
 
     if dry_run {
-        if let Some(ref_parent) = &resolved_parent {
-            println!("→ [DRY RUN] Would rebase on {}", ref_parent.as_str());
+        println!("→ [DRY RUN] Would save current branch: {original_branch}");
+    }
+
+    // Determine the starting index based on --root flag
+    let start_index = if root {
+        // With --root, first branch is fixed from root
+        if dry_run {
+            println!("→ [DRY RUN] Would checkout {}", branches[0]);
+            println!("→ [DRY RUN] Would fix {} from repository root", branches[0]);
+        } else {
+            checkout_branch(&branches[0]);
+            run_fix_branch_by_name(None, true, dry_run);
+        }
+        1
+    } else {
+        // Without --root, first branch is just a parent for the second
+        1
+    };
+
+    // Process remaining branches
+    // Use branch names (not SHAs) so we get the current tip after each rewrite
+    for i in start_index..branches.len() {
+        let parent = &branches[i - 1];
+        let child = &branches[i];
+
+        if dry_run {
+            println!("→ [DRY RUN] Would checkout {child}");
+            println!("→ [DRY RUN] Would rebase {child} on {parent}");
+        } else {
+            checkout_branch(child);
+            run_fix_branch_by_name(Some(parent), false, dry_run);
+        }
+    }
+
+    // Return to the original branch
+    if dry_run {
+        println!("→ [DRY RUN] Would return to original branch: {original_branch}");
+        println!("✓ [DRY RUN] Stack would be fixed successfully");
+    } else {
+        checkout_branch(&original_branch);
+        println!("✓ Stack fixed successfully");
+    }
+}
+
+/// Runs the fix-branch operation on the current branch using a branch name
+fn run_fix_branch_by_name(parent: Option<&str>, root: bool, dry_run: bool) {
+    if dry_run {
+        if let Some(parent_name) = parent {
+            println!("→ [DRY RUN] Would rebase on {parent_name}");
         } else {
             println!("→ [DRY RUN] Would skip rebase (root mode)");
         }
         if root {
-            println!("→ [DRY RUN] Would fix committer data from the repository root");
+            println!("→ [DRY RUN] Would fix committer data and normalize dates from the repository root");
         } else {
-            println!("→ [DRY RUN] Would fix committer data to match author data");
+            println!("→ [DRY RUN] Would fix committer data and normalize dates");
         }
         println!("✓ [DRY RUN] Branch would be fixed successfully");
-        exit(EXIT_OK);
+        return;
     }
 
     // Rebase the current branch on top of the parent
-    if let Some(ref_parent) = &resolved_parent {
-        println!("→ Rebasing on {}", ref_parent.as_str());
-        git_run(&["rebase", "--rebase-merges", "--", ref_parent.as_str()]);
+    if let Some(parent_name) = parent {
+        println!("→ Rebasing on {parent_name}");
+        git_run(&[
+            "rebase",
+            "--rebase-merges",
+            "--no-keep-empty",
+            "--update-refs",
+            "--",
+            parent_name,
+        ]);
+
+        // Autosquash any fixup!/squash!/amend! commits
+        if has_autosquash_commits(parent_name) {
+            println!("→ Autosquashing fixup/squash/amend commits");
+            git_run_with_env(
+                &[
+                    "rebase",
+                    "--interactive",
+                    "--autosquash",
+                    "--no-keep-empty",
+                    "--update-refs",
+                    "--",
+                    parent_name,
+                ],
+                &[("GIT_SEQUENCE_EDITOR", ":")],
+            );
+        }
     } else {
         println!("→ Skipping rebase (root mode)");
     }
 
     // Prepare the commit range we're going to inspect or rewrite
-    let parent_range = resolved_parent
-        .as_ref()
-        .map(|parent_ref| format!("{}..HEAD", parent_ref.as_str()));
+    let parent_range = parent.map(|name| format!("{name}..HEAD"));
     let commit_range = match (&parent_range, root) {
         (Some(range), false) => CommitRange::ParentRange(range.to_owned()),
         (None, true) => CommitRange::RootRange,
@@ -275,9 +420,9 @@ fn main() {
     // Short-circuit when everything already matches
     match branch_needs_fix(&commit_range) {
         Ok(false) => {
-            println!("→ Commits already have matching committer data");
+            println!("→ Commits already have matching committer data and monotonic dates");
             println!("✓ No rewrite needed");
-            exit(EXIT_OK);
+            return;
         }
         Ok(true) => { /* continue */ }
         Err(message) => {
@@ -286,21 +431,71 @@ fn main() {
         }
     }
 
-    // Rewrite all commits to use the author data
+    // Rewrite all commits to use the author data and normalize dates
     if root {
-        println!("→ Fixing committer data to match author data from the repository root");
+        println!("→ Fixing committer data and normalizing dates from the repository root");
     } else {
-        println!("→ Fixing committer data to match author data");
+        println!("→ Fixing committer data and normalizing dates");
     }
 
-    let env_filter = r#"
+    // Create temp file path for tracking max date across commits
+    let max_date_file = std::env::temp_dir().join(format!(
+        "git-fix-branch-max-date-{}",
+        std::process::id()
+    ));
+
+    // Clean up any stale temp file from previous runs
+    let _ = std::fs::remove_file(&max_date_file);
+
+    let env_filter = format!(
+        r#"
+MAX_DATE_FILE="{max_date_file}"
+
+# Read current max date (or 0 if first commit)
+if [ -f "$MAX_DATE_FILE" ]; then
+    max_date=$(cat "$MAX_DATE_FILE")
+else
+    max_date=0
+fi
+
+# Get author date as unix timestamp using git
+author_unix=$(git log -1 --format='%ad' --date=unix "$GIT_COMMIT" 2>/dev/null || echo "0")
+
+# Also get max parent date for this commit
+parent_max=0
+for parent in $(git rev-parse "$GIT_COMMIT^@" 2>/dev/null); do
+    parent_date=$(git log -1 --format='%ad' --date=unix "$parent" 2>/dev/null || echo "0")
+    if [ "$parent_date" -gt "$parent_max" ] 2>/dev/null; then
+        parent_max=$parent_date
+    fi
+done
+
+# Use the greater of running max or parent max
+if [ "$parent_max" -gt "$max_date" ] 2>/dev/null; then
+    max_date=$parent_max
+fi
+
+# Determine final date
+if [ "$author_unix" -le "$max_date" ] 2>/dev/null; then
+    final_date=$((max_date + 1))
+else
+    final_date=$author_unix
+fi
+
+# Update max date file
+echo "$final_date" > "$MAX_DATE_FILE"
+
+# Export the normalized values
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
 export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
-"#;
+export GIT_AUTHOR_DATE="@$final_date"
+export GIT_COMMITTER_DATE="@$final_date"
+"#,
+        max_date_file = max_date_file.display()
+    );
 
     let mut command = Command::new("git");
-    command.args(["filter-branch", "--force", "--env-filter", env_filter, "--"]);
+    command.args(["filter-branch", "--force", "--env-filter", &env_filter, "--"]);
 
     match (&commit_range, root) {
         (CommitRange::ParentRange(range), false) => {
@@ -321,6 +516,9 @@ export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
         .stderr(Stdio::piped())
         .output();
 
+    // Clean up temp file
+    let _ = std::fs::remove_file(&max_date_file);
+
     match result {
         Ok(output) if output.status.success() => {
             emit_filter_branch_output(&output.stdout, &output.stderr);
@@ -336,7 +534,197 @@ export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
             }
 
             println!("✓ Branch fixed successfully");
-            exit(EXIT_OK);
+        }
+        Ok(output) => {
+            emit_filter_branch_output(&output.stdout, &output.stderr);
+            eprintln!("✗ ERROR: git filter-branch failed");
+            exit(EXIT_SOFTWARE);
+        }
+        Err(error) => {
+            eprintln!("✗ ERROR: Failed to execute git filter-branch");
+            eprintln!("DETAILS: {error}");
+            exit(EXIT_SOFTWARE);
+        }
+    }
+}
+
+/// Runs the fix-branch operation on the current branch
+fn run_fix_branch(parent: Option<&GitRef>, root: bool, dry_run: bool) {
+    if dry_run {
+        if let Some(ref_parent) = parent {
+            println!("→ [DRY RUN] Would rebase on {}", ref_parent.as_str());
+        } else {
+            println!("→ [DRY RUN] Would skip rebase (root mode)");
+        }
+        if root {
+            println!("→ [DRY RUN] Would fix committer data and normalize dates from the repository root");
+        } else {
+            println!("→ [DRY RUN] Would fix committer data and normalize dates");
+        }
+        println!("✓ [DRY RUN] Branch would be fixed successfully");
+        return;
+    }
+
+    // Rebase the current branch on top of the parent
+    if let Some(ref_parent) = parent {
+        println!("→ Rebasing on {}", ref_parent.as_str());
+        git_run(&[
+            "rebase",
+            "--rebase-merges",
+            "--no-keep-empty",
+            "--update-refs",
+            "--",
+            ref_parent.as_str(),
+        ]);
+
+        // Autosquash any fixup!/squash!/amend! commits
+        if has_autosquash_commits(ref_parent.as_str()) {
+            println!("→ Autosquashing fixup/squash/amend commits");
+            git_run_with_env(
+                &[
+                    "rebase",
+                    "--interactive",
+                    "--autosquash",
+                    "--no-keep-empty",
+                    "--update-refs",
+                    "--",
+                    ref_parent.as_str(),
+                ],
+                &[("GIT_SEQUENCE_EDITOR", ":")],
+            );
+        }
+    } else {
+        println!("→ Skipping rebase (root mode)");
+    }
+
+    // Prepare the commit range we're going to inspect or rewrite
+    let parent_range = parent.map(|parent_ref| format!("{}..HEAD", parent_ref.as_str()));
+    let commit_range = match (&parent_range, root) {
+        (Some(range), false) => CommitRange::ParentRange(range.to_owned()),
+        (None, true) => CommitRange::RootRange,
+        _ => {
+            eprintln!("✗ ERROR: Unexpected state while determining commit range.");
+            exit(EXIT_SOFTWARE);
+        }
+    };
+
+    // Short-circuit when everything already matches
+    match branch_needs_fix(&commit_range) {
+        Ok(false) => {
+            println!("→ Commits already have matching committer data and monotonic dates");
+            println!("✓ No rewrite needed");
+            return;
+        }
+        Ok(true) => { /* continue */ }
+        Err(message) => {
+            eprintln!("✗ ERROR: {message}");
+            exit(EXIT_SOFTWARE);
+        }
+    }
+
+    // Rewrite all commits to use the author data and normalize dates
+    if root {
+        println!("→ Fixing committer data and normalizing dates from the repository root");
+    } else {
+        println!("→ Fixing committer data and normalizing dates");
+    }
+
+    // Create temp file path for tracking max date across commits
+    let max_date_file = std::env::temp_dir().join(format!(
+        "git-fix-branch-max-date-{}",
+        std::process::id()
+    ));
+
+    // Clean up any stale temp file from previous runs
+    let _ = std::fs::remove_file(&max_date_file);
+
+    let env_filter = format!(
+        r#"
+MAX_DATE_FILE="{max_date_file}"
+
+# Read current max date (or 0 if first commit)
+if [ -f "$MAX_DATE_FILE" ]; then
+    max_date=$(cat "$MAX_DATE_FILE")
+else
+    max_date=0
+fi
+
+# Get author date as unix timestamp using git
+author_unix=$(git log -1 --format='%ad' --date=unix "$GIT_COMMIT" 2>/dev/null || echo "0")
+
+# Also get max parent date for this commit
+parent_max=0
+for parent in $(git rev-parse "$GIT_COMMIT^@" 2>/dev/null); do
+    parent_date=$(git log -1 --format='%ad' --date=unix "$parent" 2>/dev/null || echo "0")
+    if [ "$parent_date" -gt "$parent_max" ] 2>/dev/null; then
+        parent_max=$parent_date
+    fi
+done
+
+# Use the greater of running max or parent max
+if [ "$parent_max" -gt "$max_date" ] 2>/dev/null; then
+    max_date=$parent_max
+fi
+
+# Determine final date
+if [ "$author_unix" -le "$max_date" ] 2>/dev/null; then
+    final_date=$((max_date + 1))
+else
+    final_date=$author_unix
+fi
+
+# Update max date file
+echo "$final_date" > "$MAX_DATE_FILE"
+
+# Export the normalized values
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+export GIT_AUTHOR_DATE="@$final_date"
+export GIT_COMMITTER_DATE="@$final_date"
+"#,
+        max_date_file = max_date_file.display()
+    );
+
+    let mut command = Command::new("git");
+    command.args(["filter-branch", "--force", "--env-filter", &env_filter, "--"]);
+
+    match (&commit_range, root) {
+        (CommitRange::ParentRange(range), false) => {
+            command.arg(range);
+        }
+        (CommitRange::RootRange, true) => {
+            command.args(["--root", "HEAD"]);
+        }
+        _ => {
+            eprintln!("✗ ERROR: Unexpected state while preparing git filter-branch.");
+            exit(EXIT_SOFTWARE);
+        }
+    }
+
+    let result = command
+        .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&max_date_file);
+
+    match result {
+        Ok(output) if output.status.success() => {
+            emit_filter_branch_output(&output.stdout, &output.stderr);
+
+            match git_head_sha() {
+                Ok(after_head) => {
+                    println!("Rewrite {after_head}");
+                }
+                Err(message) => {
+                    eprintln!("✗ ERROR: {message}");
+                    exit(EXIT_SOFTWARE);
+                }
+            }
+
+            println!("✓ Branch fixed successfully");
         }
         Ok(output) => {
             emit_filter_branch_output(&output.stdout, &output.stderr);
@@ -353,7 +741,18 @@ export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
 
 /// Executes a git command with the given arguments, exiting on failure
 fn git_run(args: &[&str]) {
-    let status = match Command::new("git").args(args).status() {
+    git_run_with_env(args, &[]);
+}
+
+/// Executes a git command with the given arguments and environment variables, exiting on failure
+fn git_run_with_env(args: &[&str], env_vars: &[(&str, &str)]) {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let status = match cmd.status() {
         Ok(status) => status,
         Err(error) => {
             eprintln!("✗ ERROR: Failed to execute git {}", args.join(" "));
@@ -365,6 +764,26 @@ fn git_run(args: &[&str]) {
     if !status.success() {
         eprintln!("✗ ERROR: git {} failed", args.join(" "));
         exit(EXIT_SOFTWARE);
+    }
+}
+
+/// Checks if there are any fixup!/squash!/amend! commits in the range
+fn has_autosquash_commits(parent: &str) -> bool {
+    let output = Command::new("git")
+        .args(["log", "--format=%s", &format!("{parent}..HEAD")])
+        .output()
+        .ok();
+
+    match output {
+        Some(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines().any(|line| {
+                line.starts_with("fixup! ")
+                    || line.starts_with("squash! ")
+                    || line.starts_with("amend! ")
+            })
+        }
+        _ => false,
     }
 }
 
@@ -420,8 +839,9 @@ fn resolve_default_branch() -> Result<String, String> {
         })
 }
 
-/// Checks if any commits in the given range need committer data fixing
+/// Checks if any commits in the given range need committer data fixing or date normalization
 fn branch_needs_fix(range: &CommitRange) -> Result<bool, String> {
+    // Check committer data mismatch
     let mut command = Command::new("git");
     command.args(["log", "--format=%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd"]);
 
@@ -459,7 +879,114 @@ fn branch_needs_fix(range: &CommitRange) -> Result<bool, String> {
         }
     }
 
+    // Check for non-monotonic dates
+    if dates_need_normalization(range)? {
+        return Ok(true);
+    }
+
     Ok(false)
+}
+
+/// Checks if any commits have dates that are not monotonically increasing
+fn dates_need_normalization(range: &CommitRange) -> Result<bool, String> {
+    // Get commits with their dates and parent hashes in topological order (oldest first)
+    let mut command = Command::new("git");
+    command.args([
+        "log",
+        "--reverse",
+        "--topo-order",
+        "--format=%H %P %ad",
+        "--date=unix",
+    ]);
+
+    match range {
+        CommitRange::ParentRange(spec) => command.arg(spec),
+        CommitRange::RootRange => command.arg("HEAD"),
+    };
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Failed to inspect commit dates: {error}"))?;
+
+    if !output.status.success() {
+        return Err(String::from("git log failed when checking commit dates"));
+    }
+
+    if output.stdout.is_empty() {
+        return Ok(false);
+    }
+
+    // Build a map of commit hash -> normalized date
+    let mut date_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let commit_hash = parts[0];
+
+        // Parse the date (last part after parent hashes)
+        // Format: "HASH PARENT1 PARENT2 ... DATE"
+        let date_str = line.rsplit(' ').next().unwrap_or("0");
+        let author_date: i64 = date_str.parse().unwrap_or(0);
+
+        // Find max parent date
+        let parent_hashes: Vec<&str> = if parts.len() >= 2 {
+            parts[1].split(' ').filter(|s| !s.is_empty()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Get max parent date from our map (for commits in the range)
+        // or from git (for parents outside the range)
+        let mut max_parent_date: i64 = 0;
+        for parent in &parent_hashes {
+            let parent_date = if let Some(&date) = date_map.get(*parent) {
+                date
+            } else {
+                // Parent is outside our range, get its date from git
+                get_commit_date(parent).unwrap_or(0)
+            };
+            if parent_date > max_parent_date {
+                max_parent_date = parent_date;
+            }
+        }
+
+        // Determine what the normalized date would be
+        let normalized_date = if author_date <= max_parent_date {
+            max_parent_date + 1
+        } else {
+            author_date
+        };
+
+        // If the date would change, normalization is needed
+        if normalized_date != author_date {
+            return Ok(true);
+        }
+
+        date_map.insert(commit_hash.to_owned(), normalized_date);
+    }
+
+    Ok(false)
+}
+
+/// Gets the author date of a commit as a unix timestamp
+fn get_commit_date(commit: &str) -> Result<i64, String> {
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%ad", "--date=unix", commit])
+        .output()
+        .map_err(|error| format!("Failed to get commit date: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("git log failed for commit {commit}"));
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|_err| format!("Failed to parse date for commit {commit}"))
 }
 
 /// Gets the current HEAD commit SHA
