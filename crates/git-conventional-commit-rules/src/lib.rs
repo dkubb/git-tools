@@ -139,6 +139,9 @@ pub enum ValidationError {
 
     #[error("Subject uses '!' but no BREAKING CHANGE footer was found")]
     MessageBangWithoutBreakingFooter,
+
+    #[error("Body must start with bullet points (- or *) containing action verbs (Remove, Fix, Refactor, Move, Rename, Change, Add, Upgrade, Downgrade).\nFirst line: {line}")]
+    BodyMustStartWithBulletPoint { line: String },
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +230,37 @@ impl FromStr for CommitBody {
                     line: line.to_string(),
                 });
             }
+        }
+
+        // Check that body starts with bullet point containing action verb
+        let first_line = body.lines()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| ValidationError::BodyEmpty)?;
+
+        let trimmed_first = first_line.trim();
+
+        // Must start with bullet point
+        if !trimmed_first.starts_with("- ") && !trimmed_first.starts_with("* ") {
+            return Err(ValidationError::BodyMustStartWithBulletPoint {
+                line: first_line.to_string(),
+            });
+        }
+
+        // Extract text after bullet point and check for action verb
+        let after_bullet = trimmed_first.strip_prefix("- ")
+            .or_else(|| trimmed_first.strip_prefix("* "))
+            .unwrap();
+
+        let action_verbs = ["Remove", "Fix", "Refactor", "Move", "Rename", "Change", "Add", "Upgrade", "Downgrade"];
+        let has_action_verb = action_verbs.iter().any(|verb| {
+            after_bullet.starts_with(verb) &&
+            (after_bullet.len() == verb.len() || after_bullet.chars().nth(verb.len()).map(|c| c.is_whitespace()).unwrap_or(false))
+        });
+
+        if !has_action_verb {
+            return Err(ValidationError::BodyMustStartWithBulletPoint {
+                line: first_line.to_string(),
+            });
         }
 
         Ok(CommitBody(body.to_string()))
