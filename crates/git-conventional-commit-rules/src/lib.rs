@@ -1,8 +1,222 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::str::FromStr;
+use strum::IntoEnumIterator;
 use thiserror::Error;
 
 const SUBJECT_MAX_LEN: usize = 70;
 const BODY_LINE_MAX_LEN: usize = 72;
+
+// ============================================================================
+// Verb - Action verbs for commit body bullet points (transformation priority)
+// ============================================================================
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumIter,
+    strum::EnumString,
+)]
+#[repr(u8)]
+pub enum Verb {
+    Remove = 0,
+    Fix = 1,
+    Refactor = 2,
+    Move = 3,
+    Rename = 4,
+    Change = 5,
+    Add = 6,
+    Upgrade = 7,
+    Downgrade = 8,
+}
+
+impl Verb {
+    pub fn allowed_list() -> String {
+        Self::iter()
+            .map(|verb| verb.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+// ============================================================================
+// Action - A single bullet point action in the commit body
+// ============================================================================
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Action {
+    verb: Verb,
+    detail: String,
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.verb, self.detail)
+    }
+}
+
+impl Action {
+    pub fn new(verb: Verb, detail: &str) -> Result<Self, ValidationError> {
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err(ValidationError::ActionDetailEmpty);
+        }
+
+        // Ensure detail ends with a period
+        let detail = if detail.ends_with('.') {
+            detail.to_owned()
+        } else {
+            format!("{}.", detail)
+        };
+
+        Ok(Self { verb, detail })
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, ValidationError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ValidationError::ActionEmpty);
+        }
+
+        let (verb_raw, detail_raw) = trimmed
+            .split_once(' ')
+            .ok_or(ValidationError::ActionMissingDetail)?;
+
+        let verb: Verb = verb_raw.parse().map_err(|_| ValidationError::ActionInvalidVerb {
+            word: verb_raw.to_owned(),
+            allowed: Verb::allowed_list(),
+        })?;
+
+        Self::new(verb, detail_raw)
+    }
+
+    pub fn verb(&self) -> Verb {
+        self.verb
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl PartialOrd for Action {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Action {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.verb.cmp(&other.verb) {
+            Ordering::Equal => self.detail.cmp(&other.detail),
+            ordering @ (Ordering::Less | Ordering::Greater) => ordering,
+        }
+    }
+}
+
+// ============================================================================
+// ActionList - A sorted, deduplicated list of actions
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct ActionList {
+    actions: Vec<Action>,
+}
+
+impl ActionList {
+    pub fn new(actions: Vec<Action>) -> Self {
+        let mut dedup: HashSet<Action> = HashSet::from_iter(actions);
+        let mut actions: Vec<_> = dedup.drain().collect();
+        actions.sort();
+        Self { actions }
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+
+    pub fn body(&self) -> String {
+        self.actions
+            .iter()
+            .flat_map(|action| self.to_body_lines(action))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn to_body_lines(&self, action: &Action) -> Vec<String> {
+        let mut result = Vec::new();
+        let text = action.to_string();
+
+        for raw_line in text.lines() {
+            let normalized = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.is_empty() {
+                continue;
+            }
+            let prefix = if result.is_empty() { "- " } else { "  " };
+            result.push(format!("{prefix}{normalized}"));
+        }
+
+        result
+    }
+
+    /// Parse a body string into an ActionList, validating each action
+    pub fn parse(body: &str) -> Result<Self, ValidationError> {
+        let mut actions = Vec::new();
+        let mut current_action_lines: Vec<&str> = Vec::new();
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Check if this is a new bullet point
+            if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                // Process previous action if any
+                if !current_action_lines.is_empty() {
+                    let action_text = current_action_lines.join(" ");
+                    let action_text = action_text.strip_prefix("- ")
+                        .or_else(|| action_text.strip_prefix("* "))
+                        .unwrap_or(&action_text);
+                    actions.push(Action::parse(action_text)?);
+                    current_action_lines.clear();
+                }
+                current_action_lines.push(trimmed);
+            } else if !current_action_lines.is_empty() {
+                // Continuation line
+                current_action_lines.push(trimmed);
+            } else {
+                // Line doesn't start with bullet and no current action
+                return Err(ValidationError::BodyMustStartWithBulletPoint {
+                    line: line.to_string(),
+                });
+            }
+        }
+
+        // Process last action
+        if !current_action_lines.is_empty() {
+            let action_text = current_action_lines.join(" ");
+            let action_text = action_text.strip_prefix("- ")
+                .or_else(|| action_text.strip_prefix("* "))
+                .unwrap_or(&action_text);
+            actions.push(Action::parse(action_text)?);
+        }
+
+        if actions.is_empty() {
+            return Err(ValidationError::BodyEmpty);
+        }
+
+        Ok(Self::new(actions))
+    }
+}
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
@@ -140,8 +354,23 @@ pub enum ValidationError {
     #[error("Subject uses '!' but no BREAKING CHANGE footer was found")]
     MessageBangWithoutBreakingFooter,
 
-    #[error("Body must start with bullet points (- or *) containing action verbs (Remove, Fix, Refactor, Move, Rename, Change, Add, Upgrade, Downgrade).\nFirst line: {line}")]
+    #[error("Body must start with bullet points (- or *).\nLine: {line}")]
     BodyMustStartWithBulletPoint { line: String },
+
+    #[error("Action cannot be empty")]
+    ActionEmpty,
+
+    #[error("Action must start with one of: {allowed}\nGot: '{word}'")]
+    ActionInvalidVerb { word: String, allowed: String },
+
+    #[error("Action must have a description after the verb")]
+    ActionMissingDetail,
+
+    #[error("Action description cannot be empty")]
+    ActionDetailEmpty,
+
+    #[error("Body is not in canonical form.\nExpected:\n{expected}\n\nGot:\n{actual}")]
+    BodyNotCanonical { expected: String, actual: String },
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +437,10 @@ impl FromStr for CommitScope {
 pub struct CommitBody(String);
 
 impl CommitBody {
+    pub fn from_action_list(action_list: &ActionList) -> Self {
+        Self(action_list.body())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -223,6 +456,7 @@ impl FromStr for CommitBody {
             return Err(ValidationError::BodyEmpty);
         }
 
+        // Check line lengths
         for line in body.lines() {
             if !line.is_empty() && line.len() > BODY_LINE_MAX_LEN {
                 return Err(ValidationError::BodyLineTooLong {
@@ -232,34 +466,15 @@ impl FromStr for CommitBody {
             }
         }
 
-        // Check that body starts with bullet point containing action verb
-        let first_line = body.lines()
-            .find(|line| !line.trim().is_empty())
-            .ok_or_else(|| ValidationError::BodyEmpty)?;
+        // Parse into ActionList (validates each action and sorts by priority)
+        let action_list = ActionList::parse(body)?;
 
-        let trimmed_first = first_line.trim();
-
-        // Must start with bullet point
-        if !trimmed_first.starts_with("- ") && !trimmed_first.starts_with("* ") {
-            return Err(ValidationError::BodyMustStartWithBulletPoint {
-                line: first_line.to_string(),
-            });
-        }
-
-        // Extract text after bullet point and check for action verb
-        let after_bullet = trimmed_first.strip_prefix("- ")
-            .or_else(|| trimmed_first.strip_prefix("* "))
-            .unwrap();
-
-        let action_verbs = ["Remove", "Fix", "Refactor", "Move", "Rename", "Change", "Add", "Upgrade", "Downgrade"];
-        let has_action_verb = action_verbs.iter().any(|verb| {
-            after_bullet.starts_with(verb) &&
-            (after_bullet.len() == verb.len() || after_bullet.chars().nth(verb.len()).map(|c| c.is_whitespace()).unwrap_or(false))
-        });
-
-        if !has_action_verb {
-            return Err(ValidationError::BodyMustStartWithBulletPoint {
-                line: first_line.to_string(),
+        // Round-trip: re-serialize and compare to ensure canonical form
+        let canonical = action_list.body();
+        if canonical != body {
+            return Err(ValidationError::BodyNotCanonical {
+                expected: canonical,
+                actual: body.to_string(),
             });
         }
 
