@@ -3,173 +3,21 @@
 //! [dependencies]
 //! clap = { version = "4.5.48", features = ["derive"] }
 //! git-conventional-commit-rules = { path = "crates/git-conventional-commit-rules" }
-//! nonempty = "0.12.0"
-//! strum = { version = "0.27.2", features = ["derive"] }
-//! thiserror = "2.0.17"
 //! ```
 //!
 //! Create a conventional commit with proper formatting
 
 use clap::Parser;
 use git_conventional_commit_rules::{
-    CommitScope, CommitSubject, CommitSummary, CommitType, validate_commit_message,
+    Action, ActionList, CommitScope, CommitSubject, CommitSummary, CommitType,
+    validate_commit_message,
 };
-use nonempty::NonEmpty;
-use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, exit};
-use strum::IntoEnumIterator;
-use thiserror::Error;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 64;
 const EXIT_SOFTWARE: i32 = 70;
-
-#[derive(Debug, Error)]
-enum ActionError {
-    #[error("action must start with one of {allowed} - got '{word}'")]
-    ActionInvalidVerb { word: String, allowed: String },
-    #[error("action descriptions must contain a verb")]
-    ActionMissingVerb,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    Hash,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    strum::AsRefStr,
-    strum::Display,
-    strum::EnumIter,
-    strum::EnumString,
-)]
-#[repr(u8)]
-enum Verb {
-    Remove = 0,
-    Fix = 1,
-    Refactor = 2,
-    Move = 3,
-    Rename = 4,
-    Change = 5,
-    Add = 6,
-    Upgrade = 7,
-    Downgrade = 8,
-}
-
-impl Verb {
-    fn allowed_list() -> String {
-        Self::iter()
-            .map(|verb| verb.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn parse(verb_str: &str) -> Result<Self, ActionError> {
-        verb_str.parse().map_err(|_err| {
-            ActionError::ActionInvalidVerb {
-                word: verb_str.to_owned(),
-                allowed: Self::allowed_list(),
-            }
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Action {
-    detail: String,
-    verb: Verb,
-}
-
-impl std::fmt::Display for Action {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.verb, self.detail)
-    }
-}
-
-impl Action {
-    fn new(raw: &str) -> Result<Self, ActionError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(ActionError::ActionMissingVerb);
-        }
-
-        let (verb_raw, detail_raw) = trimmed
-            .split_once(' ')
-            .ok_or(ActionError::ActionMissingVerb)?;
-        let verb = Verb::parse(verb_raw)?;
-        let detail = detail_raw.trim();
-        
-        // Ensure detail ends with a period
-        let detail = if detail.ends_with('.') {
-            detail.to_owned()
-        } else {
-            format!("{}.", detail)
-        };
-        
-        Ok(Self {
-            detail,
-            verb,
-        })
-    }
-}
-
-impl PartialOrd for Action {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Action {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.verb.cmp(&other.verb) {
-            Ordering::Equal => self.detail.cmp(&other.detail),
-            ordering @ (Ordering::Less | Ordering::Greater) => ordering,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ActionList {
-    actions: Vec<Action>,
-}
-
-impl ActionList {
-    fn body(&self) -> String {
-        self.actions
-            .iter()
-            .flat_map(|action| self.to_body_lines(action))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn to_body_lines(&self, action: &Action) -> Vec<String> {
-        let mut result = Vec::new();
-        let text = action.to_string();
-
-        for raw_line in text.lines() {
-            let normalized = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
-            if normalized.is_empty() {
-                continue;
-            }
-            let prefix = if result.is_empty() { "- " } else { "  " };
-            result.push(format!("{prefix}{normalized}"));
-        }
-
-        result
-    }
-
-    fn from_nonempty(list: NonEmpty<Action>) -> Self {
-        let mut dedup: HashSet<Action> = HashSet::from_iter(list);
-        let mut actions: Vec<_> = dedup.drain().collect();
-        actions.sort();
-        Self { actions }
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(name = "git-conventional-commit")]
@@ -249,18 +97,22 @@ fn main() {
         }
     }
 
-    let parsed_actions = args
+    let parsed_actions: Vec<Action> = args
         .actions
         .into_iter()
-        .map(|raw| Action::new(&raw))
+        .map(|raw| Action::parse(&raw))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| {
             eprintln!("✗ ERROR: {}", e);
             exit(EXIT_USAGE);
         });
 
-    let non_empty = NonEmpty::from_vec(parsed_actions).unwrap();
-    let action_list = ActionList::from_nonempty(non_empty);
+    if parsed_actions.is_empty() {
+        eprintln!("✗ ERROR: At least one --action is required");
+        exit(EXIT_USAGE);
+    }
+
+    let action_list = ActionList::new(parsed_actions);
 
     let summary = args
         .summary
