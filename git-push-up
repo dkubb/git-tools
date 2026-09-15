@@ -265,6 +265,9 @@ struct Args {
     base: String,
     /// Local branch to publish (defaults to the checked-out branch).
     branch: Option<String>,
+    /// Print the plan without fetching, rebasing, or pushing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Failures that stop publication.
@@ -475,6 +478,18 @@ fn require_ancestor(ancestor: &str, branch: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Show the mutation boundary without depending on cached remote refs.
+#[expect(
+    clippy::print_stdout,
+    reason = "Dry-run output is the requested CLI result"
+)]
+fn print_plan(branch: &str, base: &str) {
+    println!("Fetch origin/{base} and origin/{branch}");
+    println!("Require a clean worktree and inclusion of origin/{branch}");
+    println!("Rebase {branch} onto the fetched origin/{base} with --update-refs");
+    println!("Push only {branch} to origin with --force-with-lease --force-if-includes");
+}
+
 /// Reading tracking refs instead would admit a concurrent background fetch.
 fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
     let mut matches = output.lines().filter_map(|line| {
@@ -577,6 +592,10 @@ fn run(args: &Args) -> Result<(), Error> {
     )?;
     let base = resolve_base(args)?;
     let target = RebaseTarget::new(branch, base)?;
+    if args.dry_run {
+        print_plan(target.branch().as_str(), target.base().as_str());
+        return Ok(());
+    }
     publish(&target)
 }
 

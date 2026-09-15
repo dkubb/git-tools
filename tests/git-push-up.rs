@@ -371,6 +371,24 @@ fn does_not_follow_tags_from_user_configuration() {
     assert_eq!(fixture.git_at(&["tag"], &fixture.remote).stdout, "");
 }
 
+/// Dry run does not fetch or rewrite.
+#[test]
+fn dry_run_does_not_fetch_or_rewrite() {
+    let fixture = Fixture::new();
+    fixture.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke(&["--base", "main", "--dry-run"]);
+    assert!(
+        result
+            .stdout
+            .contains("--force-with-lease --force-if-includes"),
+        "{}",
+        result.stdout
+    );
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
+}
+
 /// Failed fetch does not rebase.
 #[test]
 fn failed_fetch_does_not_rebase() {
