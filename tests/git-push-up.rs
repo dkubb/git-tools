@@ -1,0 +1,627 @@
+//! Real Git integration tests, run with `rust-script --test git-push-up`.
+//! Each test owns its repositories and child-process environment. Only gh is faked.
+
+#![expect(
+    clippy::unwrap_used,
+    reason = "Failed fixture setup must fail the test"
+)]
+
+use core::iter::once;
+use core::time::Duration;
+use std::env;
+use std::fs::{self, File, Permissions};
+use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use tempfile::TempDir;
+use wait_timeout::ChildExt as _;
+
+/// Successful process exit.
+const SUCCESS: i32 = 0;
+/// Invalid command line.
+const USAGE_ERROR: i32 = 2;
+
+/// Captured child result, retaining exact output for identity assertions.
+struct Response {
+    /// Exit status; signal termination fails the harness.
+    code: i32,
+    /// Diagnostic stream.
+    stderr: String,
+    /// Result stream.
+    stdout: String,
+}
+
+impl Response {
+    /// Require successful fixture commands with useful failure diagnostics.
+    fn checked(self) -> Self {
+        assert_eq!(self.code, SUCCESS, "{}{}", self.stdout, self.stderr);
+        self
+    }
+}
+
+/// One test's owned repositories, executable overrides, and initial commit IDs.
+struct Fixture {
+    /// Latest base available on the remote.
+    base: String,
+    /// Directory for fake gh and the command under test.
+    bin: PathBuf,
+    /// Optional Git dispatch override used by the fetch race witness.
+    exec_path: Option<PathBuf>,
+    /// Absolute real Git path, bypassing the race wrapper in fixture commands.
+    git_program: String,
+    /// Original published feature tip.
+    old_feature: String,
+    /// Bare remote repository.
+    remote: PathBuf,
+    /// Selected client checkout.
+    repo: PathBuf,
+    /// Lifetime owner; removes every fixture file on drop, including failures.
+    root: TempDir,
+}
+
+impl Fixture {
+    /// Assert the original destination has not changed.
+    fn assert_not_pushed(&self) {
+        assert_eq!(self.rev_at("feature", &self.remote), self.old_feature);
+    }
+
+    /// Run an arbitrary successful fixture command.
+    fn command(&self, program: &str, args: &[&str], cwd: &Path) -> Response {
+        self.run(program, args, cwd).checked()
+    }
+
+    /// Add a commit to the client.
+    fn commit(&self, filename: &str, contents: &str, subject: &str) {
+        self.commit_at(filename, contents, subject, &self.repo);
+    }
+
+    /// Add a commit to a specific fixture checkout.
+    fn commit_at(&self, filename: &str, contents: &str, subject: &str, repo: &Path) {
+        fs::write(repo.join(filename), contents).unwrap();
+        self.git_at(&["add", filename], repo);
+        self.git_at(&["commit", "-m", subject], repo);
+    }
+
+    /// Run a successful Git command in the selected checkout.
+    fn git(&self, args: &[&str]) -> Response {
+        self.git_at(args, &self.repo)
+    }
+
+    /// Run a successful Git command in a chosen directory.
+    fn git_at(&self, args: &[&str], cwd: &Path) -> Response {
+        self.git_result_at(args, cwd).checked()
+    }
+
+    /// Inspect a Git command that may reject an operation.
+    fn git_result(&self, args: &[&str]) -> Response {
+        self.git_result_at(args, &self.repo)
+    }
+
+    /// Inspect a Git command in a chosen directory.
+    fn git_result_at(&self, args: &[&str], cwd: &Path) -> Response {
+        self.run(&self.git_program, args, cwd)
+    }
+
+    /// Configure deterministic authorship without reading the user's config.
+    fn identity(&self, repo: &Path) {
+        self.git_at(&["config", "user.name", "Test"], repo);
+        self.git_at(&["config", "user.email", "test@example.invalid"], repo);
+    }
+
+    /// Exercise the command through Git's global -C dispatch.
+    fn invoke(&self, args: &[&str]) -> Response {
+        self.invoke_result(args).checked()
+    }
+
+    /// Exercise a command that may reject publication.
+    fn invoke_result(&self, args: &[&str]) -> Response {
+        let mut arguments = vec!["-C", path(&self.repo), "push-up"];
+        arguments.extend_from_slice(args);
+        self.git_result_at(&arguments, self.root.path())
+    }
+
+    /// Create a feature branch behind a newly advanced base on a private remote.
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let repo = root.path().join("repo");
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        symlink(binary(), bin.join("git-push-up")).unwrap();
+        let git_program = env::split_paths(&env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        let mut fixture = Self {
+            base: String::new(),
+            bin,
+            exec_path: None,
+            git_program: path(&git_program).to_owned(),
+            old_feature: String::new(),
+            remote,
+            repo,
+            root,
+        };
+        fixture.git_at(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                path(&fixture.remote),
+            ],
+            fixture.root.path(),
+        );
+        fixture.git_at(
+            &["clone", path(&fixture.remote), path(&fixture.repo)],
+            fixture.root.path(),
+        );
+        fixture.identity(&fixture.repo);
+        fixture.commit("initial.txt", "initial", "Add initial file");
+        fixture.git(&["push", "origin", "main"]);
+        fixture.git(&["switch", "-c", "feature"]);
+        fixture.commit("feature.txt", "feature", "Add feature");
+        fixture.git(&["push", "-u", "origin", "feature"]);
+        fixture.old_feature = fixture.rev("feature");
+        fixture.git(&["switch", "main"]);
+        fixture.commit("base.txt", "base", "Add base change");
+        fixture.git(&["push", "origin", "main"]);
+        fixture.base = fixture.rev("main");
+        fixture.git(&["switch", "feature"]);
+        fixture
+    }
+
+    /// Read a fixture object ID from the client.
+    fn rev(&self, reference: &str) -> String {
+        self.rev_at(reference, &self.repo)
+    }
+
+    /// Read a fixture object ID without changing its spelling.
+    fn rev_at(&self, reference: &str, repo: &Path) -> String {
+        let response = self.git_at(&["rev-parse", reference], repo);
+        response.stdout.strip_suffix('\n').unwrap().to_owned()
+    }
+
+    /// Bound subprocess runtime and isolate Git configuration per child.
+    fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Response {
+        let mut command = Command::new(program);
+        command.args(args).current_dir(cwd);
+        for (key, _) in env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") {
+                command.env_remove(key);
+            }
+        }
+        let inherited = env::var_os("PATH").unwrap();
+        let search =
+            env::join_paths(once(self.bin.clone()).chain(env::split_paths(&inherited))).unwrap();
+        command
+            .env("PATH", search)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_EDITOR", "true");
+        if let Some(directory) = self.exec_path.as_ref() {
+            command.env("GIT_EXEC_PATH", directory);
+        }
+        capture(&mut command)
+    }
+}
+
+/// Build the production executable once in a separate target to avoid Cargo lock recursion.
+fn binary() -> &'static Path {
+    static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    EXECUTABLE.get_or_init(|| {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target = manifest.join("target/integration");
+        capture(Command::new("cargo").args([
+            "build",
+            "--quiet",
+            "--manifest-path",
+            path(&manifest.join("Cargo.toml")),
+            "--target-dir",
+            path(&target),
+        ]))
+        .checked();
+        let executable = target.join("debug/git-push-up");
+        fs::copy(
+            target.join("debug").join(env!("CARGO_PKG_NAME")),
+            &executable,
+        )
+        .unwrap();
+        executable
+    })
+}
+
+/// Capture to files so verbose children cannot block on full pipe buffers.
+fn capture(command: &mut Command) -> Response {
+    let directory = tempfile::tempdir().unwrap();
+    let stdout = directory.path().join("stdout");
+    let stderr = directory.path().join("stderr");
+    command
+        .stdout(Stdio::from(File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(File::create(&stderr).unwrap()));
+    let mut child = command.spawn().unwrap();
+    let status = child.wait_timeout(Duration::from_mins(2)).unwrap();
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(status.is_some(), "command timed out: {command:?}");
+    Response {
+        code: status.unwrap().code().unwrap(),
+        stderr: fs::read_to_string(stderr).unwrap(),
+        stdout: fs::read_to_string(stdout).unwrap(),
+    }
+}
+
+/// Borrow paths as command arguments without lossy conversion.
+fn path(value: &Path) -> &str {
+    value.to_str().unwrap()
+}
+/// Quote one argument for the tiny executable fixture hooks.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+/// Encode only fixture-owned command arguments into a shell hook.
+fn shell(args: &[&str]) -> String {
+    args.iter()
+        .map(|value| quote(value))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Branch in other worktree is not moved.
+#[test]
+fn branch_in_other_worktree_is_not_moved() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "sibling"]);
+    fixture.git(&[
+        "worktree",
+        "add",
+        path(&fixture.root.path().join("sibling")),
+        "sibling",
+    ]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(fixture.rev("sibling"), fixture.old_feature);
+    assert_ne!(fixture.rev("feature"), fixture.old_feature);
+}
+
+/// Conflict does not push.
+#[test]
+fn conflict_does_not_push() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "main"]);
+    fixture.commit("feature.txt", "conflict", "Add conflicting base change");
+    fixture.git(&["push", "origin", "main"]);
+    fixture.git(&["switch", "feature"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert_eq!(
+        fixture
+            .git_result(&["rev-parse", "--verify", "REBASE_HEAD"])
+            .code,
+        SUCCESS
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Current branch rebases and pushes.
+#[test]
+fn current_branch_rebases_and_pushes() {
+    let fixture = Fixture::new();
+    fixture.git(&[
+        "update-ref",
+        "refs/remotes/origin/main",
+        &fixture.rev("feature^"),
+    ]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(fixture.rev("feature^"), fixture.base);
+    assert_eq!(fixture.rev("origin/main"), fixture.base);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    assert_ne!(fixture.rev("feature"), fixture.old_feature);
+}
+
+/// Detached head requires a selected branch.
+#[test]
+fn detached_head_requires_a_selected_branch() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "--detach"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("pass a branch explicitly"),
+        "{}",
+        result.stderr
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Dirty worktree fails before fetch.
+#[test]
+fn dirty_worktree_fails_before_fetch() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("untracked"), "do not lose").unwrap();
+    fixture.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("clean worktree"),
+        "{}",
+        result.stderr
+    );
+    assert_ne!(
+        fixture
+            .git_result(&["show-ref", "--verify", "refs/remotes/origin/main"])
+            .code,
+        SUCCESS
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Does not follow tags from user configuration.
+#[test]
+fn does_not_follow_tags_from_user_configuration() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "push.followTags", "true"]);
+    fixture.git(&["tag", "-a", "base-tag", "origin/main", "-m", "Base tag"]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(fixture.git_at(&["tag"], &fixture.remote).stdout, "");
+}
+
+/// Failed fetch does not rebase.
+#[test]
+fn failed_fetch_does_not_rebase() {
+    let fixture = Fixture::new();
+    let result = fixture.invoke_result(&["--base", "missing"]);
+    assert_ne!(result.code, SUCCESS);
+    assert_eq!(fixture.rev("feature"), fixture.old_feature);
+    fixture.assert_not_pushed();
+}
+
+/// Force if includes rejects background fetch after rebase.
+#[test]
+fn force_if_includes_rejects_background_fetch_after_rebase() {
+    let fixture = Fixture::new();
+    let other = fixture.root.path().join("other");
+    fixture.git(&[
+        "clone",
+        "--branch",
+        "feature",
+        path(&fixture.remote),
+        path(&other),
+    ]);
+    fixture.identity(&other);
+    fixture.commit_at("other.txt", "other", "Add concurrent change", &other);
+    let remote_tip = fixture.rev_at("feature", &other);
+    let hook = fixture.repo.join(".git").join("hooks").join("post-rewrite");
+    let push = shell(&[
+        &fixture.git_program,
+        "-C",
+        path(&other),
+        "push",
+        "origin",
+        "feature",
+    ]);
+    let fetch = shell(&[
+        &fixture.git_program,
+        "fetch",
+        "origin",
+        "+refs/heads/feature:refs/remotes/origin/feature",
+    ]);
+    fs::write(&hook, format!("#!/bin/sh\nset -eu\n{push}\n{fetch}\n")).unwrap();
+    fs::set_permissions(&hook, Permissions::from_mode(0o755)).unwrap();
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
+    assert_eq!(fixture.rev("origin/feature"), remote_tip);
+    assert!(result.stderr.contains("rejected"), "{}", result.stderr);
+}
+
+/// Forwarded help works outside repository.
+#[test]
+fn forwarded_help_works_outside_repository() {
+    let fixture = Fixture::new();
+    let direct = fixture.command(path(binary()), &["--help"], fixture.root.path());
+    let forwarded = fixture.git_at(&["push-up", "--", "--help"], fixture.root.path());
+    assert_eq!(forwarded.stdout, direct.stdout);
+    assert_eq!(forwarded.stderr, "");
+    fixture.assert_not_pushed();
+}
+
+/// Multiple push mappings are rejected.
+#[test]
+fn multiple_push_mappings_are_rejected() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "--add", "remote.origin.push", "feature:feature"]);
+    fixture.git(&["config", "--add", "remote.origin.push", "main:main"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    fixture.assert_not_pushed();
+}
+
+/// Multiple push urls are rejected.
+#[test]
+fn multiple_push_urls_are_rejected() {
+    let fixture = Fixture::new();
+    fixture.git(&[
+        "config",
+        "--add",
+        "remote.origin.pushurl",
+        path(&fixture.remote),
+    ]);
+    fixture.git(&[
+        "config",
+        "--add",
+        "remote.origin.pushurl",
+        path(&fixture.remote),
+    ]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    fixture.assert_not_pushed();
+}
+
+/// Rejects merge commits without flattening them.
+#[test]
+fn rejects_merge_commits_without_flattening_them() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "side", "feature^"]);
+    fixture.commit("side.txt", "side", "Add side change");
+    fixture.git(&["switch", "feature"]);
+    fixture.git(&["merge", "--no-ff", "side", "-m", "Merge side"]);
+    let before = fixture.rev("feature");
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("linear branch is required"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(fixture.rev("feature"), before);
+    fixture.assert_not_pushed();
+}
+
+/// Rejects same base and source.
+#[test]
+fn rejects_same_base_and_source() {
+    let fixture = Fixture::new();
+    let result = fixture.invoke_result(&["--base", "feature"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(result.stderr.contains("must differ"), "{}", result.stderr);
+    fixture.assert_not_pushed();
+}
+
+/// Rejects unknown options.
+#[test]
+fn rejects_unknown_options() {
+    let fixture = Fixture::new();
+    let result = fixture.invoke_result(&["--repo", path(&fixture.repo)]);
+    assert_eq!(result.code, USAGE_ERROR);
+    assert!(
+        result.stderr.contains("unexpected argument"),
+        "{}",
+        result.stderr
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Remote changes must be integrated before rebase.
+#[test]
+fn remote_changes_must_be_integrated_before_rebase() {
+    let fixture = Fixture::new();
+    let other = fixture.root.path().join("other");
+    fixture.git(&[
+        "clone",
+        "--branch",
+        "feature",
+        path(&fixture.remote),
+        path(&other),
+    ]);
+    fixture.identity(&other);
+    fixture.commit_at("other.txt", "other", "Add remote change", &other);
+    fixture.git_at(&["push", "origin", "feature"], &other);
+    let remote_tip = fixture.rev_at("feature", &fixture.remote);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("integrate it first"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(fixture.rev("feature"), fixture.old_feature);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
+}
+
+/// Selected branch updates local refs only.
+#[test]
+fn selected_branch_updates_local_refs_only() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "sibling"]);
+    fixture.git(&["push", "origin", "sibling"]);
+    fixture.git(&["switch", "main"]);
+    fixture.invoke(&["--base", "main", "feature"]);
+    assert_eq!(fixture.rev("sibling"), fixture.rev("feature"));
+    assert_eq!(
+        fixture.rev_at("sibling", &fixture.remote),
+        fixture.old_feature
+    );
+    assert_eq!(
+        fixture.git(&["branch", "--show-current"]).stdout.trim(),
+        "feature"
+    );
+}
+
+/// Tag collision preserves current branch identity.
+#[test]
+fn tag_collision_preserves_current_branch_identity() {
+    let fixture = Fixture::new();
+    fixture.git(&["tag", "feature", "main"]);
+    fixture.git(&["branch", "heads/feature", "refs/heads/feature"]);
+    fixture.git(&[
+        "push",
+        "origin",
+        "refs/heads/heads/feature:refs/heads/heads/feature",
+    ]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(
+        fixture.git(&["symbolic-ref", "HEAD"]).stdout,
+        "refs/heads/feature\n"
+    );
+    assert_eq!(fixture.rev("refs/heads/feature^"), fixture.base);
+    assert_eq!(
+        fixture.rev_at("refs/heads/heads/feature", &fixture.remote),
+        fixture.old_feature
+    );
+    assert_eq!(
+        fixture.rev("refs/heads/feature"),
+        fixture.rev_at("refs/heads/feature", &fixture.remote)
+    );
+}
+
+/// Unicode whitespace preserves current branch identity.
+#[test]
+fn unicode_whitespace_preserves_current_branch_identity() {
+    let fixture = Fixture::new();
+    let name = "feature\u{a0}";
+    fixture.git(&["switch", "-c", name]);
+    fixture.git(&[
+        "push",
+        "-u",
+        "origin",
+        &format!("refs/heads/{name}:refs/heads/{name}"),
+    ]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(
+        fixture.git(&["symbolic-ref", "HEAD"]).stdout,
+        format!("refs/heads/{name}\n")
+    );
+    assert_eq!(fixture.rev(&format!("refs/heads/{name}^")), fixture.base);
+    assert_eq!(
+        fixture.rev(&format!("refs/heads/{name}")),
+        fixture.rev_at(&format!("refs/heads/{name}"), &fixture.remote)
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Unsupported remote configs fail before mutation.
+#[test]
+fn unsupported_remote_configs_fail_before_mutation() {
+    let fixture = Fixture::new();
+    let before = fixture.git(&["show-ref"]).stdout;
+    let configurations = [
+        ("remote.origin.mirror", "true"),
+        ("remote.origin.pushurl", "different"),
+        ("remote.origin.push", ":feature"),
+        ("remote.origin.push", "refs/heads/*:refs/heads/*"),
+    ];
+    for (key, value) in configurations {
+        fixture.git(&["config", key, value]);
+        let result = fixture.invoke_result(&["--base", "main", "feature"]);
+        assert_ne!(result.code, SUCCESS);
+        assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+        fixture.assert_not_pushed();
+        fixture.git(&["config", "--unset-all", key]);
+    }
+}
