@@ -52,7 +52,7 @@ extern crate alloc;
     reason = "Keep constructors restricted if module visibility changes"
 )]
 mod domain {
-    use super::{Error, query};
+    use super::{Error, config, query, record};
 
     /// Git owns the grammar; a private constructor preserves its evidence.
     /// The 1024-byte operational cap is estimated, not a Git protocol limit.
@@ -133,6 +133,64 @@ mod domain {
                 branch,
                 destination,
             })
+        }
+    }
+    /// One named remote with one shared fetch/push endpoint.
+    /// Separate or multiple push URLs cannot share this command's atomic fetch.
+    pub(super) struct Remote {
+        /// Validated name in Git's remote-tracking namespace.
+        name: BranchName,
+        /// Endpoint used to scope GitHub PR lookup.
+        url: String,
+    }
+
+    impl Remote {
+        /// Borrow the configured remote name.
+        pub(super) fn name(&self) -> &str {
+            self.name.as_str()
+        }
+
+        /// Reject configurations that cannot be covered by one fetched lease.
+        pub(super) fn try_new(value: &str) -> Result<Self, Error> {
+            let name = BranchName::try_new(value)?;
+            let mirror = query(
+                "git",
+                &[
+                    "config",
+                    "--type=bool",
+                    "--default=false",
+                    "--get",
+                    &format!("remote.{value}.mirror"),
+                ],
+            )?;
+            if record(&mirror)? == "true" {
+                return Err(Error::PushConfiguration("mirror remotes are unsupported"));
+            }
+            let fetch = query("git", &["remote", "get-url", "--all", value])?;
+            let push = query("git", &["remote", "get-url", "--push", "--all", value])?;
+            let url = record(&fetch)?;
+            if url.is_empty() || record(&push)? != url {
+                return Err(Error::PushConfiguration(
+                    "one identical fetch/push URL is required",
+                ));
+            }
+            // Validate cardinality even when a CLI refspec overrides the mapping.
+            if let Some(spec) = config(&format!("remote.{value}.push"))?
+                && (spec.contains('*') || spec.starts_with(':') || spec.starts_with('+'))
+            {
+                return Err(Error::PushConfiguration(
+                    "push defaults must name one branch without force, wildcards, or deletion",
+                ));
+            }
+            Ok(Self {
+                name,
+                url: url.to_owned(),
+            })
+        }
+
+        /// Borrow the repository endpoint for PR discovery.
+        pub(super) fn url(&self) -> &str {
+            &self.url
         }
     }
 }
@@ -278,7 +336,7 @@ mod tests {
 use alloc::string::FromUtf8Error;
 use clap::Parser;
 use core::iter::once;
-use domain::{BranchName, CommitId, RebaseTarget};
+use domain::{BranchName, CommitId, RebaseTarget, Remote};
 use std::env;
 use std::io;
 use std::process::{Command, ExitCode};
@@ -287,7 +345,10 @@ use thiserror::Error;
 /// Rebase onto the latest fetched PR base, then push the selected branch.
 ///
 /// Select a repository with `git -C <path> push-up`. Both branches must
-/// already exist on origin. The selected local branch must include its remote
+/// already exist on the resolved push remote. The push remote follows
+/// the checked-out branch, as in git push.
+/// Mirror, wildcard, multiple-ref and separate-push-URL configurations are rejected.
+/// The selected local branch must include its remote
 /// tip before rewriting unless --replace is supplied. A successful rebase leaves
 /// that branch checked out and rewritten even if the subsequent push fails.
 /// Default mode can move other local branches through --update-refs. Replacement
@@ -423,40 +484,6 @@ impl Publication<'_> {
     }
 }
 
-/// Reject endpoints that cannot share one fetched publication lease.
-fn validate_remote(value: &str) -> Result<(), Error> {
-    let mirror = query(
-        "git",
-        &[
-            "config",
-            "--type=bool",
-            "--default=false",
-            "--get",
-            &format!("remote.{value}.mirror"),
-        ],
-    )?;
-    if record(&mirror)? == "true" {
-        return Err(Error::PushConfiguration("mirror remotes are unsupported"));
-    }
-    let fetch = query("git", &["remote", "get-url", "--all", value])?;
-    let push = query("git", &["remote", "get-url", "--push", "--all", value])?;
-    let url = record(&fetch)?;
-    if url.is_empty() || record(&push)? != url {
-        return Err(Error::PushConfiguration(
-            "one identical fetch/push URL is required",
-        ));
-    }
-    // Validate cardinality even when a CLI refspec overrides the mapping.
-    if let Some(spec) = config(&format!("remote.{value}.push"))?
-        && (spec.contains('*') || spec.starts_with(':') || spec.starts_with('+'))
-    {
-        return Err(Error::PushConfiguration(
-            "push defaults must name one branch without force, wildcards, or deletion",
-        ));
-    }
-    Ok(())
-}
-
 /// Read one optional configuration value without losing subprocess failures.
 fn config(key: &str) -> Result<Option<String>, Error> {
     optional_query(&["config", "--get-all", key])?
@@ -493,6 +520,82 @@ fn optional_query(args: &[&str]) -> Result<Option<String>, Error> {
             program: "git".to_owned(),
             source,
         })
+}
+
+/// Follow Git's push-remote precedence and sole-remote/origin fallback.
+fn resolve_remote() -> Result<Remote, Error> {
+    let head = optional_query(&["symbolic-ref", "--quiet", "HEAD"])?;
+    let current = head
+        .as_deref()
+        .map(record)
+        .transpose()?
+        .map(|name| name.strip_prefix("refs/heads/").ok_or(Error::InvalidBranch))
+        .transpose()?;
+    if let Some(branch) = current
+        && let Some(name) = config(&format!("branch.{branch}.pushRemote"))?
+    {
+        return Remote::try_new(&name);
+    }
+    if let Some(name) = config("remote.pushDefault")? {
+        return Remote::try_new(&name);
+    }
+    if let Some(branch) = current
+        && let Some(name) = config(&format!("branch.{branch}.remote"))?
+    {
+        return Remote::try_new(&name);
+    }
+    Remote::try_new(&fallback_remote()?)
+}
+
+/// Git uses the sole configured remote, otherwise origin.
+fn fallback_remote() -> Result<String, Error> {
+    let remotes = query("git", &["remote"])?;
+    Ok(record(&remotes).unwrap_or("origin").to_owned())
+}
+
+/// Resolve only supported branch refspecs, preserving their exact spelling.
+fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Error> {
+    let (source, destination_input) = input
+        .split_once(':')
+        .map_or((input, None), |(source, destination)| {
+            (source, Some(destination))
+        });
+    if source.starts_with('+') {
+        return Err(Error::InvalidBranch);
+    }
+    let source_name = if source == "HEAD" {
+        current_branch().map_err(|error| Error::Head(Box::new(error)))?
+    } else {
+        source
+            .strip_prefix("refs/heads/")
+            .unwrap_or(source)
+            .to_owned()
+    };
+    let branch = BranchName::try_new(&source_name)?;
+    let destination = destination_input
+        .map(|name| BranchName::try_new(name.strip_prefix("refs/heads/").unwrap_or(name)))
+        .transpose()?;
+    Ok((branch, destination))
+}
+
+/// Resolve one explicit branch pair against the configured push remote.
+fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
+    let input = match args.branch.as_ref() {
+        Some(branch) => branch.clone(),
+        None => current_branch().map_err(|error| Error::Head(Box::new(error)))?,
+    };
+    let (branch, destination) = parse_selection(&input)?;
+    query(
+        "git",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", branch.as_str()),
+        ],
+    )?;
+    let remote = resolve_remote()?;
+    let base = resolve_base(args, destination.as_ref().unwrap_or(&branch), &remote)?;
+    Ok((RebaseTarget::new(branch, destination, base)?, remote))
 }
 
 /// Capture subprocess output, preserving command failures and exact text decoding.
@@ -548,7 +651,7 @@ fn record(text: &str) -> Result<&str, Error> {
 }
 
 /// Resolve only the selected branch's PR; never guess a default base.
-fn resolve_base(args: &Args, source: &BranchName) -> Result<BranchName, Error> {
+fn resolve_base(args: &Args, source: &BranchName, remote: &Remote) -> Result<BranchName, Error> {
     let branch = source.as_str();
     if let Some(base) = args.base.as_ref() {
         return BranchName::try_new(base);
@@ -559,7 +662,7 @@ fn resolve_base(args: &Args, source: &BranchName) -> Result<BranchName, Error> {
             "pr",
             "list",
             "--repo",
-            record(&query("git", &["remote", "get-url", "origin"])?)?,
+            remote.url(),
             "--head",
             branch,
             "--state",
@@ -606,12 +709,15 @@ fn require_ancestor(ancestor: &str, branch: &str) -> Result<(), Error> {
     clippy::print_stdout,
     reason = "Dry-run output is the requested CLI result"
 )]
-fn print_plan(target: &RebaseTarget, replace: bool) {
+fn print_plan(target: &RebaseTarget, remote: &Remote, replace: bool) {
+    let remote_name = remote.name();
     let branch = target.branch().as_str();
     let base = target.base().as_str();
     let destination = target.destination().as_str();
-    println!("Fetch origin/{base} and origin/{destination}");
-    println!("Source: {branch}; destination: origin/{destination}; base: origin/{base}");
+    println!("Fetch {remote_name}/{base} and {remote_name}/{destination}");
+    println!(
+        "Source: {branch}; destination: {remote_name}/{destination}; base: {remote_name}/{base}"
+    );
     println!("Require a clean worktree");
     if replace {
         println!(
@@ -626,10 +732,10 @@ fn print_plan(target: &RebaseTarget, replace: bool) {
             "Push only {branch}:{destination} with --force-with-lease=refs/heads/{destination}:<fetched-destination-sha>"
         );
     } else {
-        println!("Require inclusion of origin/{destination}");
-        println!("Rebase {branch} onto the fetched origin/{base} with --update-refs");
+        println!("Require inclusion of {remote_name}/{destination}");
+        println!("Rebase {branch} onto the fetched {remote_name}/{base} with --update-refs");
         println!(
-            "Push only {branch}:{destination} to origin with --force-with-lease --force-if-includes"
+            "Push only {branch}:{destination} to {remote_name} with --force-with-lease --force-if-includes"
         );
     }
 }
@@ -651,7 +757,8 @@ fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
 }
 
 /// Fetch once, pin the fetched base, then rewrite and publish only on success.
-fn publish(target: &RebaseTarget, replace: bool) -> Result<(), Error> {
+fn publish(target: &RebaseTarget, remote: &Remote, replace: bool) -> Result<(), Error> {
+    let remote_name = remote.name();
     let branch = target.branch().as_str();
     let base = target.base().as_str();
     let destination = target.destination().as_str();
@@ -659,8 +766,8 @@ fn publish(target: &RebaseTarget, replace: bool) -> Result<(), Error> {
         return Err(Error::DirtyWorktree);
     }
     let local_ref = format!("refs/heads/{branch}");
-    let base_ref = format!("refs/remotes/origin/{base}");
-    let remote_ref = format!("refs/remotes/origin/{destination}");
+    let base_ref = format!("refs/remotes/{remote_name}/{base}");
+    let remote_ref = format!("refs/remotes/{remote_name}/{destination}");
     let fetched = query(
         "git",
         &[
@@ -673,7 +780,7 @@ fn publish(target: &RebaseTarget, replace: bool) -> Result<(), Error> {
             "--no-recurse-submodules",
             "--atomic",
             "--no-tags",
-            "origin",
+            remote_name,
             &format!("+refs/heads/{base}:{base_ref}"),
             &format!("+refs/heads/{destination}:{remote_ref}"),
         ],
@@ -710,7 +817,7 @@ fn publish(target: &RebaseTarget, replace: bool) -> Result<(), Error> {
         &publication.lease(destination),
         publication.inclusion_option(),
         "--no-follow-tags",
-        "origin",
+        remote_name,
         &format!("{local_ref}:refs/heads/{destination}"),
     ])
 }
@@ -724,55 +831,15 @@ fn current_branch() -> Result<String, Error> {
     Ok(name.to_owned())
 }
 
-/// Resolve only supported branch refspecs, preserving their exact spelling.
-fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Error> {
-    let (source, destination_input) = input
-        .split_once(':')
-        .map_or((input, None), |(source, destination)| {
-            (source, Some(destination))
-        });
-    if source.starts_with('+') {
-        return Err(Error::InvalidBranch);
-    }
-    let source_name = if source == "HEAD" {
-        current_branch().map_err(|error| Error::Head(Box::new(error)))?
-    } else {
-        source
-            .strip_prefix("refs/heads/")
-            .unwrap_or(source)
-            .to_owned()
-    };
-    let branch = BranchName::try_new(&source_name)?;
-    let destination = destination_input
-        .map(|name| BranchName::try_new(name.strip_prefix("refs/heads/").unwrap_or(name)))
-        .transpose()?;
-    Ok((branch, destination))
-}
-
 /// Resolve inputs before crossing the mutation boundary.
 fn run(args: &Args) -> Result<(), Error> {
     query("git", &["rev-parse", "--show-toplevel"])?;
-    validate_remote("origin")?;
-    let input = match args.branch.as_ref() {
-        Some(branch) => branch.clone(),
-        None => current_branch().map_err(|error| Error::Head(Box::new(error)))?,
-    };
-    let (branch, destination) = parse_selection(&input)?;
-    query(
-        "git",
-        &[
-            "show-ref",
-            "--verify",
-            &format!("refs/heads/{}", branch.as_str()),
-        ],
-    )?;
-    let base = resolve_base(args, destination.as_ref().unwrap_or(&branch))?;
-    let target = RebaseTarget::new(branch, destination, base)?;
+    let (target, remote) = resolve_selection(args)?;
     if args.dry_run {
-        print_plan(&target, args.replace);
+        print_plan(&target, &remote, args.replace);
         return Ok(());
     }
-    publish(&target, args.replace)
+    publish(&target, &remote, args.replace)
 }
 
 /// Report one actionable failure and preserve a nonzero process status.

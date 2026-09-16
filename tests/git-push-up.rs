@@ -461,6 +461,34 @@ fn explicit_destination_uses_its_pr() {
     );
 }
 
+/// Explicit source uses checked out branch remote.
+#[test]
+fn explicit_source_uses_checked_out_branch_remote() {
+    let fixture = Fixture::new();
+    fixture.git(&["remote", "add", "publish", path(&fixture.remote)]);
+    fixture.git(&["config", "branch.main.pushRemote", "publish"]);
+    fixture.git(&["config", "branch.feature.pushRemote", "missing"]);
+    fixture.git(&["switch", "main"]);
+    let plan = fixture.invoke(&["--dry-run", "--base", "main", "feature:feature"]);
+    assert!(
+        plan.stdout.contains("destination: publish/feature"),
+        "{}",
+        plan.stdout
+    );
+}
+
+/// Explicit source works with detached head.
+#[test]
+fn explicit_source_works_with_detached_head() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "--detach"]);
+    fixture.invoke(&["--replace", "--base", "main", "feature:feature"]);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+}
+
 /// Failed fetch does not rebase.
 #[test]
 fn failed_fetch_does_not_rebase() {
@@ -701,6 +729,28 @@ fn numeric_branch_uses_head_filter() {
     fixture.assert_not_pushed();
 }
 
+/// Push remote precedence.
+#[test]
+fn push_remote_precedence() {
+    let fixture = Fixture::new();
+    fixture.git(&["remote", "add", "global", path(&fixture.remote)]);
+    fixture.git(&["remote", "add", "branch", path(&fixture.remote)]);
+    fixture.git(&["config", "remote.pushDefault", "global"]);
+    let mut plan = fixture.invoke(&["--dry-run", "--base", "main"]);
+    assert!(
+        plan.stdout.contains("destination: global/feature"),
+        "{}",
+        plan.stdout
+    );
+    fixture.git(&["config", "branch.feature.pushRemote", "branch"]);
+    plan = fixture.invoke(&["--dry-run", "--base", "main"]);
+    assert!(
+        plan.stdout.contains("destination: branch/feature"),
+        "{}",
+        plan.stdout
+    );
+}
+
 /// Rejects merge commits without flattening them.
 #[test]
 fn rejects_merge_commits_without_flattening_them() {
@@ -770,6 +820,25 @@ fn remote_changes_must_be_integrated_before_rebase() {
     );
     assert_eq!(fixture.rev("feature"), fixture.old_feature);
     assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
+}
+
+/// Renamed remote is used for fetch and push.
+#[test]
+fn renamed_remote_is_used_for_fetch_and_push() {
+    let fixture = Fixture::new();
+    fixture.git(&["remote", "rename", "origin", "publish"]);
+    fixture.git(&[
+        "update-ref",
+        "refs/remotes/publish/main",
+        &fixture.rev("feature^"),
+    ]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(fixture.rev("publish/main"), fixture.base);
+    assert_eq!(fixture.rev("feature^"), fixture.base);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
 }
 
 /// Replacement conflict does not publish.
@@ -992,6 +1061,21 @@ fn silent_query_failure_reports_status() {
     );
     assert_eq!(fixture.git(&["show-ref"]).stdout, before);
     fixture.assert_not_pushed();
+}
+
+/// Single remote fallback.
+#[test]
+fn single_remote_fallback() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "--unset-upstream"]);
+    fixture.git(&["remote", "rename", "origin", "publish"]);
+    fixture.git(&["config", "push.default", "current"]);
+    let plan = fixture.invoke(&["--dry-run", "--base", "main"]);
+    assert!(
+        plan.stdout.contains("destination: publish/feature"),
+        "{}",
+        plan.stdout
+    );
 }
 
 /// Tag collision preserves current branch identity.
