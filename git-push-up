@@ -288,8 +288,10 @@ use thiserror::Error;
 ///
 /// Select a repository with `git -C <path> push-up`. Both branches must
 /// already exist on origin. The selected local branch must include its remote
-/// tip before rewriting. A successful rebase leaves that branch checked out.
-/// Other local branches may move through --update-refs; only the selected destination is pushed.
+/// tip before rewriting unless --replace is supplied. A successful rebase leaves
+/// that branch checked out and rewritten even if the subsequent push fails.
+/// Default mode can move other local branches through --update-refs. Replacement
+/// mode disables that behavior. Only the selected destination is pushed.
 /// Requires Git with fetch --porcelain support.
 #[derive(Debug, Parser)]
 #[command(name = "git-push-up")]
@@ -303,6 +305,10 @@ struct Args {
     /// Print the plan without fetching, rebasing, or pushing.
     #[arg(long)]
     dry_run: bool,
+    /// Replace non-ancestral destination history using a lease pinned at fetch.
+    /// Does not move other local branches through --update-refs.
+    #[arg(long)]
+    replace: bool,
 }
 
 /// Failures that stop publication.
@@ -378,6 +384,43 @@ enum Error {
     /// Source and base cannot refer to the same branch.
     #[error("source and destination must differ from the base")]
     SameBranch,
+}
+
+/// Publication policies carry only the evidence needed by their push command.
+enum Publication<'fetched> {
+    /// Require remote ancestry and Git's reflog-based inclusion protection.
+    Integrate,
+    /// Authorize replacement only while the fetched destination tip is unchanged.
+    Replace(&'fetched CommitId),
+}
+
+impl Publication<'_> {
+    /// Rewritten history deliberately need not include the previous destination.
+    const fn inclusion_option(&self) -> &str {
+        match *self {
+            Self::Integrate => "--force-if-includes",
+            Self::Replace(_) => "--no-force-if-includes",
+        }
+    }
+
+    /// Encode the lease at the Git boundary without consulting mutable refs again.
+    fn lease(&self, destination: &str) -> String {
+        match *self {
+            Self::Integrate => "--force-with-lease".to_owned(),
+            Self::Replace(expected) => format!(
+                "--force-with-lease=refs/heads/{destination}:{}",
+                expected.as_str()
+            ),
+        }
+    }
+
+    /// Replacement must not move sibling branches, even if enabled in Git config.
+    const fn update_refs_option(&self) -> &str {
+        match *self {
+            Self::Integrate => "--update-refs",
+            Self::Replace(_) => "--no-update-refs",
+        }
+    }
 }
 
 /// Reject endpoints that cannot share one fetched publication lease.
@@ -563,16 +606,32 @@ fn require_ancestor(ancestor: &str, branch: &str) -> Result<(), Error> {
     clippy::print_stdout,
     reason = "Dry-run output is the requested CLI result"
 )]
-fn print_plan(target: &RebaseTarget) {
+fn print_plan(target: &RebaseTarget, replace: bool) {
     let branch = target.branch().as_str();
     let base = target.base().as_str();
     let destination = target.destination().as_str();
     println!("Fetch origin/{base} and origin/{destination}");
-    println!("Require a clean worktree and inclusion of origin/{destination}");
-    println!("Rebase {branch} onto the fetched origin/{base} with --update-refs");
-    println!(
-        "Push only {branch}:{destination} to origin with --force-with-lease --force-if-includes"
-    );
+    println!("Source: {branch}; destination: origin/{destination}; base: origin/{base}");
+    println!("Require a clean worktree");
+    if replace {
+        println!(
+            "Mode: replacement; PR lookup uses destination {destination} when --base is absent"
+        );
+        println!(
+            "Pin the destination SHA during fetch (unknown until execution; dry-run does not fetch)"
+        );
+        println!("Skip destination ancestry check; do not use --force-if-includes");
+        println!("Rebase {branch} onto the pinned base with --no-update-refs");
+        println!(
+            "Push only {branch}:{destination} with --force-with-lease=refs/heads/{destination}:<fetched-destination-sha>"
+        );
+    } else {
+        println!("Require inclusion of origin/{destination}");
+        println!("Rebase {branch} onto the fetched origin/{base} with --update-refs");
+        println!(
+            "Push only {branch}:{destination} to origin with --force-with-lease --force-if-includes"
+        );
+    }
 }
 
 /// Extract exactly one fetched object ID from Git's immutable porcelain output.
@@ -592,7 +651,7 @@ fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
 }
 
 /// Fetch once, pin the fetched base, then rewrite and publish only on success.
-fn publish(target: &RebaseTarget) -> Result<(), Error> {
+fn publish(target: &RebaseTarget, replace: bool) -> Result<(), Error> {
     let branch = target.branch().as_str();
     let base = target.base().as_str();
     let destination = target.destination().as_str();
@@ -622,7 +681,12 @@ fn publish(target: &RebaseTarget) -> Result<(), Error> {
     let base_commit = fetched_commit(&fetched, &base_ref)?;
     let base_sha = base_commit.as_str();
     let destination_commit = fetched_commit(&fetched, &remote_ref)?;
-    require_ancestor(destination_commit.as_str(), &local_ref)?;
+    let publication = if replace {
+        Publication::Replace(&destination_commit)
+    } else {
+        require_ancestor(destination_commit.as_str(), &local_ref)?;
+        Publication::Integrate
+    };
     let merges = query(
         "git",
         &["rev-list", "--merges", &format!("{base_sha}..{local_ref}")],
@@ -632,7 +696,7 @@ fn publish(target: &RebaseTarget) -> Result<(), Error> {
     }
     git(&[
         "rebase",
-        "--update-refs",
+        publication.update_refs_option(),
         "--no-autostash",
         "--no-autosquash",
         "--no-rebase-merges",
@@ -643,8 +707,8 @@ fn publish(target: &RebaseTarget) -> Result<(), Error> {
     require_ancestor(base_sha, &local_ref)?;
     git(&[
         "push",
-        "--force-with-lease",
-        "--force-if-includes",
+        &publication.lease(destination),
+        publication.inclusion_option(),
         "--no-follow-tags",
         "origin",
         &format!("{local_ref}:refs/heads/{destination}"),
@@ -705,10 +769,10 @@ fn run(args: &Args) -> Result<(), Error> {
     let base = resolve_base(args, destination.as_ref().unwrap_or(&branch))?;
     let target = RebaseTarget::new(branch, destination, base)?;
     if args.dry_run {
-        print_plan(&target);
+        print_plan(&target, args.replace);
         return Ok(());
     }
-    publish(&target)
+    publish(&target, args.replace)
 }
 
 /// Report one actionable failure and preserve a nonzero process status.

@@ -471,6 +471,59 @@ fn failed_fetch_does_not_rebase() {
     fixture.assert_not_pushed();
 }
 
+/// Fetch result pins base and destination before background fetch.
+#[test]
+fn fetch_result_pins_base_and_destination_before_background_fetch() {
+    let mut fixture = Fixture::new();
+    let other = fixture.root.path().join("other");
+    fixture.git(&[
+        "clone",
+        "--branch",
+        "feature",
+        path(&fixture.remote),
+        path(&other),
+    ]);
+    fixture.identity(&other);
+    fixture.commit_at(
+        "other.txt",
+        "other",
+        "Add concurrent destination change",
+        &other,
+    );
+    let remote_tip = fixture.rev_at("feature", &other);
+    fixture.git_at(&["switch", "main"], &other);
+    fixture.commit_at("new-base.txt", "new", "Advance base concurrently", &other);
+    let new_base = fixture.rev_at("main", &other);
+    let wrapper = fixture.bin.join("git");
+    let git = quote(&fixture.git_program);
+    let push = shell(&[
+        &fixture.git_program,
+        "-C",
+        path(&other),
+        "push",
+        "origin",
+        "feature",
+        "main",
+    ]);
+    let fetch = shell(&[
+        &fixture.git_program,
+        "fetch",
+        "origin",
+        "+refs/heads/feature:refs/remotes/origin/feature",
+        "+refs/heads/main:refs/remotes/origin/main",
+    ]);
+    fs::write(&wrapper, format!("#!/bin/sh\nset -eu\nif test \"$1\" = fetch; then\n{git} \"$@\"\n{push} >&2\n{fetch} >&2\nexit 0\nfi\nexec {git} \"$@\"\n")).unwrap();
+    fs::set_permissions(&wrapper, Permissions::from_mode(0o755)).unwrap();
+    fixture.exec_path = Some(fixture.bin.clone());
+    let result = fixture.invoke_result(&["--replace", "--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(result.stderr.contains("stale info"), "{}", result.stderr);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
+    assert_eq!(fixture.rev("origin/feature"), remote_tip);
+    assert_eq!(fixture.rev("origin/main"), new_base);
+    assert_eq!(fixture.rev("feature^"), fixture.base);
+}
+
 /// Force if includes rejects background fetch after rebase.
 #[test]
 fn force_if_includes_rejects_background_fetch_after_rebase() {
@@ -719,6 +772,189 @@ fn remote_changes_must_be_integrated_before_rebase() {
     assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
 }
 
+/// Replacement conflict does not publish.
+#[test]
+fn replacement_conflict_does_not_publish() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "main"]);
+    fixture.commit("feature.txt", "conflict", "Add conflict");
+    fixture.git(&["push", "origin", "main"]);
+    fixture.git(&["switch", "feature"]);
+    let result = fixture.invoke_result(&["--replace", "--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert_eq!(
+        fixture
+            .git_result(&["rev-parse", "--verify", "REBASE_HEAD"])
+            .code,
+        SUCCESS
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Replacement dry run explains policy without fetch.
+#[test]
+fn replacement_dry_run_explains_policy_without_fetch() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "temporary"]);
+    fixture.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke(&[
+        "--replace",
+        "--dry-run",
+        "--base",
+        "main",
+        "temporary:feature",
+    ]);
+    for text in [
+        "Mode: replacement",
+        "Source: temporary",
+        "destination: origin/feature",
+        "base: origin/main",
+        "PR lookup uses destination feature",
+        "Skip destination ancestry",
+        "do not use --force-if-includes",
+        "--no-update-refs",
+        "--force-with-lease=refs/heads/feature:<fetched-destination-sha>",
+        "unknown until execution",
+    ] {
+        assert!(result.stdout.contains(text), "{}", result.stdout);
+    }
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
+}
+
+/// Replacement from fresh clone preserves other refs.
+#[test]
+fn replacement_from_fresh_clone_preserves_other_refs() {
+    let mut fixture = Fixture::new();
+    let fresh = fixture.root.path().join("fresh");
+    fixture.git(&[
+        "clone",
+        "--branch",
+        "feature",
+        path(&fixture.remote),
+        path(&fresh),
+    ]);
+    fixture.repo = fresh.clone();
+    fixture.identity(&fresh);
+    assert_eq!(
+        fixture.git(&["reflog", "show", "origin/feature"]).stdout,
+        ""
+    );
+    fixture.git(&["switch", "-c", "temporary/rewrite"]);
+    fixture.git(&["commit", "--amend", "-m", "Reconstruct feature"]);
+    let reconstructed_tree = fixture.rev("HEAD^{tree}");
+    assert_eq!(reconstructed_tree, fixture.rev("origin/feature^{tree}"));
+    fixture.git(&["branch", "sibling"]);
+    let sibling = fixture.rev("sibling");
+    fixture.git(&["config", "rebase.updateRefs", "true"]);
+    fixture.git(&["config", "push.followTags", "true"]);
+    fixture.git(&["tag", "-a", "base-tag", "origin/main", "-m", "Base tag"]);
+    fixture.fake_gh("test \"$6\" = feature || exit 3; printf \"main\\n\"");
+    let before = fixture
+        .git_at(
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+            &fixture.remote,
+        )
+        .stdout;
+    fixture.invoke(&["--replace", "HEAD:feature"]);
+    let after = fixture
+        .git_at(
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+            &fixture.remote,
+        )
+        .stdout;
+    assert_eq!(
+        after,
+        before.replace(&fixture.old_feature, &fixture.rev("temporary/rewrite"))
+    );
+    assert_eq!(fixture.rev("temporary/rewrite^"), fixture.base);
+    assert_eq!(fixture.rev("feature"), fixture.old_feature);
+    assert_eq!(fixture.rev("sibling"), sibling);
+    assert_eq!(
+        fixture.rev_at("feature", &fixture.remote),
+        fixture.rev("temporary/rewrite")
+    );
+}
+
+/// Replacement lease rejects concurrent change even after fetch.
+#[test]
+fn replacement_lease_rejects_concurrent_change_even_after_fetch() {
+    let fixture = Fixture::new();
+    let other = fixture.root.path().join("other");
+    fixture.git(&[
+        "clone",
+        "--branch",
+        "feature",
+        path(&fixture.remote),
+        path(&other),
+    ]);
+    fixture.identity(&other);
+    fixture.commit_at("other.txt", "other", "Add concurrent change", &other);
+    let remote_tip = fixture.rev_at("feature", &other);
+    fixture.git(&["switch", "-c", "temporary"]);
+    fixture.git(&["commit", "--amend", "-m", "Reconstruct feature"]);
+    let hook = fixture.repo.join(".git").join("hooks").join("post-rewrite");
+    let push = shell(&[
+        &fixture.git_program,
+        "-C",
+        path(&other),
+        "push",
+        "origin",
+        "feature",
+    ]);
+    let fetch = shell(&[
+        &fixture.git_program,
+        "fetch",
+        "origin",
+        "+refs/heads/feature:refs/remotes/origin/feature",
+    ]);
+    fs::write(&hook, format!("#!/bin/sh\nset -eu\n{push}\n{fetch}\n")).unwrap();
+    fs::set_permissions(&hook, Permissions::from_mode(0o755)).unwrap();
+    let result = fixture.invoke_result(&["--replace", "--base", "main", "temporary:feature"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(result.stderr.contains("stale info"), "{}", result.stderr);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), remote_tip);
+    assert_eq!(fixture.rev("origin/feature"), remote_tip);
+    assert_eq!(fixture.rev("temporary^"), fixture.base);
+}
+
+/// Replacement publishes pre rewritten same name.
+#[test]
+fn replacement_publishes_pre_rewritten_same_name() {
+    let fixture = Fixture::new();
+    fixture.git(&["commit", "--amend", "-m", "Reconstruct feature"]);
+    let rewritten = fixture.rev("feature");
+    let denied = fixture.invoke_result(&["--base", "main"]);
+    assert!(
+        denied.stderr.contains("integrate it first"),
+        "{}",
+        denied.stderr
+    );
+    assert_eq!(fixture.rev("feature"), rewritten);
+    fixture.assert_not_pushed();
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("feature^"), fixture.base);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+}
+
+/// Replacement requires clean worktree.
+#[test]
+fn replacement_requires_clean_worktree() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("untracked"), "preserve").unwrap();
+    let result = fixture.invoke_result(&["--replace", "--base", "main"]);
+    assert!(
+        result.stderr.contains("clean worktree"),
+        "{}",
+        result.stderr
+    );
+    fixture.assert_not_pushed();
+}
+
 /// Selected branch updates local refs only.
 #[test]
 fn selected_branch_updates_local_refs_only() {
@@ -823,7 +1059,7 @@ fn unsupported_remote_configs_fail_before_mutation() {
     ];
     for (key, value) in configurations {
         fixture.git(&["config", key, value]);
-        let result = fixture.invoke_result(&["--base", "main", "feature"]);
+        let result = fixture.invoke_result(&["--replace", "--base", "main", "feature:feature"]);
         assert_ne!(result.code, SUCCESS);
         assert_eq!(fixture.git(&["show-ref"]).stdout, before);
         fixture.assert_not_pushed();
