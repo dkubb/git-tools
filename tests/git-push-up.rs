@@ -351,6 +351,28 @@ fn conflict_does_not_push() {
     fixture.assert_not_pushed();
 }
 
+/// Current and automatic setup choose same name.
+#[test]
+fn current_and_automatic_setup_choose_same_name() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "--unset-upstream"]);
+    fixture.git(&["config", "push.default", "current"]);
+    let mut plan = fixture.invoke(&["--dry-run", "--base", "main"]);
+    assert!(
+        plan.stdout.contains("destination: origin/feature"),
+        "{}",
+        plan.stdout
+    );
+    fixture.git(&["config", "push.default", "simple"]);
+    fixture.git(&["config", "push.autoSetupRemote", "true"]);
+    plan = fixture.invoke(&["--dry-run", "--base", "main"]);
+    assert!(
+        plan.stdout.contains("destination: origin/feature"),
+        "{}",
+        plan.stdout
+    );
+}
+
 /// Current branch rebases and pushes.
 #[test]
 fn current_branch_rebases_and_pushes() {
@@ -693,6 +715,24 @@ fn invalid_refspecs_fail_before_mutation() {
         assert_ne!(result.code, SUCCESS);
         assert_eq!(fixture.git(&["show-ref"]).stdout, before);
         fixture.assert_not_pushed();
+    }
+}
+
+/// Matching and nothing require explicit source.
+#[test]
+fn matching_and_nothing_require_explicit_source() {
+    let fixture = Fixture::new();
+    for policy in ["matching", "nothing"] {
+        fixture.git(&["config", "push.default", policy]);
+        let result = fixture.invoke_result(&["--base", "main"]);
+        assert_ne!(result.code, SUCCESS);
+        fixture.assert_not_pushed();
+        let plan = fixture.invoke(&["--dry-run", "--base", "main", "feature:feature"]);
+        assert!(
+            plan.stdout.contains("destination: origin/feature"),
+            "{}",
+            plan.stdout
+        );
     }
 }
 
@@ -1112,6 +1152,49 @@ fn silent_query_failure_reports_status() {
     fixture.assert_not_pushed();
 }
 
+/// Simple rejects differently named upstream.
+#[test]
+fn simple_rejects_differently_named_upstream() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "local", "feature"]);
+    fixture.git(&["branch", "--set-upstream-to", "origin/feature"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert!(
+        result.stderr.contains("simple mode requires matching"),
+        "{}",
+        result.stderr
+    );
+    fixture.assert_not_pushed();
+}
+
+/// Simple requires upstream but explicit source does not.
+#[test]
+fn simple_requires_upstream_but_explicit_source_does_not() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "--unset-upstream"]);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert!(result.stderr.contains("no upstream"), "{}", result.stderr);
+    fixture.invoke(&["--base", "main", "feature"]);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+}
+
+/// Simple requires upstream with sole non origin remote.
+#[test]
+fn simple_requires_upstream_with_sole_non_origin_remote() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "--unset-upstream"]);
+    fixture.git(&["remote", "rename", "origin", "publish"]);
+    let expected = fixture.git_result(&["push", "--dry-run"]);
+    assert_ne!(expected.code, SUCCESS);
+    let result = fixture.invoke_result(&["--base", "main"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(result.stderr.contains("no upstream"), "{}", result.stderr);
+    fixture.assert_not_pushed();
+}
+
 /// Single remote fallback.
 #[test]
 fn single_remote_fallback() {
@@ -1198,4 +1281,20 @@ fn unsupported_remote_configs_fail_before_mutation() {
         fixture.assert_not_pushed();
         fixture.git(&["config", "--unset-all", key]);
     }
+}
+
+/// Upstream destination can have another name.
+#[test]
+fn upstream_destination_can_have_another_name() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "local", "feature"]);
+    fixture.git(&["branch", "--set-upstream-to", "origin/feature"]);
+    fixture.git(&["config", "push.default", "upstream"]);
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("local^"), fixture.base);
+    assert_eq!(
+        fixture.rev("local"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    assert_eq!(fixture.rev("feature"), fixture.old_feature);
 }

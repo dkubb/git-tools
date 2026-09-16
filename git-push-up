@@ -345,8 +345,8 @@ use thiserror::Error;
 /// Rebase onto the latest fetched PR base, then push the selected branch.
 ///
 /// Select a repository with `git -C <path> push-up`. Both branches must
-/// already exist on the resolved push remote. The push remote follows
-/// the checked-out branch, as in git push.
+/// already exist on the resolved push remote. Git push defaults select one branch
+/// when no source is supplied; the push remote follows the checked-out branch, as in git push.
 /// Mirror, wildcard, multiple-ref and separate-push-URL configurations are rejected.
 /// The selected local branch must include its remote
 /// tip before rewriting unless --replace is supplied. A successful rebase leaves
@@ -578,7 +578,68 @@ fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Erro
     Ok((branch, destination))
 }
 
-/// Apply a single configured push mapping to the selected branch.
+/// Follow push.default only when the caller supplied no refspec.
+fn default_destination(branch: &BranchName, remote: &Remote) -> Result<Option<BranchName>, Error> {
+    let policy = config("push.default")?;
+    match policy.as_deref().unwrap_or("simple") {
+        "current" => Ok(None),
+        "simple" | "upstream" | "tracking" => {
+            let fetch_remote = match config(&format!("branch.{}.remote", branch.as_str()))? {
+                Some(name) => name,
+                None => fallback_remote()?,
+            };
+            let triangular = fetch_remote != remote.name();
+            let simple = policy.as_deref().unwrap_or("simple") == "simple";
+            if triangular && simple {
+                return Ok(None);
+            }
+            if triangular {
+                return Err(Error::PushConfiguration(
+                    "upstream mode requires the upstream remote",
+                ));
+            }
+            let upstream = config(&format!("branch.{}.merge", branch.as_str()))?;
+            let Some(name) = upstream else {
+                let automatic = query(
+                    "git",
+                    &[
+                        "config",
+                        "--type=bool",
+                        "--default=false",
+                        "--get",
+                        "push.autoSetupRemote",
+                    ],
+                )?;
+                return if record(&automatic)? == "true" {
+                    Ok(None)
+                } else {
+                    Err(Error::PushConfiguration(
+                        "the selected branch has no upstream",
+                    ))
+                };
+            };
+            let destination = BranchName::try_new(
+                name.strip_prefix("refs/heads/")
+                    .ok_or(Error::InvalidBranch)?,
+            )?;
+            if simple && destination != *branch {
+                return Err(Error::PushConfiguration(
+                    "simple mode requires matching upstream and local names",
+                ));
+            }
+            Ok(Some(destination))
+        }
+        "matching" => Err(Error::PushConfiguration(
+            "matching mode can publish multiple branches",
+        )),
+        "nothing" => Err(Error::PushConfiguration(
+            "push.default=nothing requires an explicit refspec",
+        )),
+        _ => Err(Error::PushConfiguration("unrecognized push.default")),
+    }
+}
+
+/// Apply a single configured push mapping or Git's default branch policy.
 fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
     let input = match args.branch.as_ref() {
         Some(branch) => branch.clone(),
@@ -604,6 +665,9 @@ fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
         } else {
             (branch, None)
         }
+    } else if args.branch.is_none() {
+        let destination = default_destination(&branch, &remote)?;
+        (branch, destination)
     } else {
         (branch, None)
     };
