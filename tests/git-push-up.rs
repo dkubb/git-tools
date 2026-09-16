@@ -295,6 +295,43 @@ fn branch_in_other_worktree_is_not_moved() {
     assert_ne!(fixture.rev("feature"), fixture.old_feature);
 }
 
+/// Configured push refspec maps explicit source.
+#[test]
+fn configured_push_refspec_maps_explicit_source() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "temporary", "feature"]);
+    fixture.git(&[
+        "config",
+        "remote.origin.push",
+        "refs/heads/temporary:refs/heads/feature",
+    ]);
+    fixture.invoke(&["--replace", "--base", "main", "temporary"]);
+    assert_eq!(
+        fixture.rev("temporary"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+}
+
+/// Configured push refspec selects branch.
+#[test]
+fn configured_push_refspec_selects_branch() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "temporary", "feature"]);
+    fixture.git(&[
+        "config",
+        "remote.origin.push",
+        "refs/heads/temporary:refs/heads/feature",
+    ]);
+    fixture.git(&["config", "push.default", "nothing"]);
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("temporary^"), fixture.base);
+    assert_eq!(
+        fixture.rev("temporary"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    assert_eq!(fixture.rev("feature"), fixture.old_feature);
+}
+
 /// Conflict does not push.
 #[test]
 fn conflict_does_not_push() {
@@ -436,6 +473,18 @@ fn explicit_base_bypasses_gh() {
     let fixture = Fixture::new();
     fixture.fake_gh("exit 99");
     fixture.invoke(&["--base", "main"]);
+}
+
+/// Explicit destination overrides configured mapping.
+#[test]
+fn explicit_destination_overrides_configured_mapping() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "remote.origin.push", "feature:wrong"]);
+    fixture.invoke(&["--base", "main", "feature:feature"]);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
 }
 
 /// Explicit destination uses its pr.

@@ -578,13 +578,13 @@ fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Erro
     Ok((branch, destination))
 }
 
-/// Resolve one explicit branch pair against the configured push remote.
+/// Apply a single configured push mapping to the selected branch.
 fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
     let input = match args.branch.as_ref() {
         Some(branch) => branch.clone(),
         None => current_branch().map_err(|error| Error::Head(Box::new(error)))?,
     };
-    let (branch, destination) = parse_selection(&input)?;
+    let (branch, explicit_destination) = parse_selection(&input)?;
     query(
         "git",
         &[
@@ -594,8 +594,29 @@ fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
         ],
     )?;
     let remote = resolve_remote()?;
-    let base = resolve_base(args, destination.as_ref().unwrap_or(&branch), &remote)?;
-    Ok((RebaseTarget::new(branch, destination, base)?, remote))
+    let mapping = config(&format!("remote.{}.push", remote.name()))?;
+    let (source, destination) = if explicit_destination.is_some() {
+        (branch, explicit_destination)
+    } else if let Some(spec) = mapping {
+        let (configured_source, configured_destination) = parse_selection(&spec)?;
+        if args.branch.is_none() || configured_source == branch {
+            (configured_source, configured_destination)
+        } else {
+            (branch, None)
+        }
+    } else {
+        (branch, None)
+    };
+    query(
+        "git",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", source.as_str()),
+        ],
+    )?;
+    let base = resolve_base(args, destination.as_ref().unwrap_or(&source), &remote)?;
+    Ok((RebaseTarget::new(source, destination, base)?, remote))
 }
 
 /// Capture subprocess output, preserving command failures and exact text decoding.
