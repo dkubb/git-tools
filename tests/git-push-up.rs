@@ -19,6 +19,8 @@ use wait_timeout::ChildExt as _;
 
 /// Successful process exit.
 const SUCCESS: i32 = 0;
+/// Rejected workflow.
+const FAILURE: i32 = 1;
 /// Invalid command line.
 const USAGE_ERROR: i32 = 2;
 
@@ -81,6 +83,13 @@ impl Fixture {
         fs::write(repo.join(filename), contents).unwrap();
         self.git_at(&["add", filename], repo);
         self.git_at(&["commit", "-m", subject], repo);
+    }
+
+    /// Supply deterministic GitHub discovery output.
+    fn fake_gh(&self, body: &str) {
+        let executable = self.bin.join("gh");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(executable, Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Run a successful Git command in the selected checkout.
@@ -389,6 +398,31 @@ fn dry_run_does_not_fetch_or_rewrite() {
     fixture.assert_not_pushed();
 }
 
+/// Empty pr list fails before mutation.
+#[test]
+fn empty_pr_list_fails_before_mutation() {
+    let fixture = Fixture::new();
+    fixture.fake_gh("exit 0");
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke_result(&[]);
+    assert_eq!(result.code, FAILURE);
+    assert!(
+        result.stderr.contains("expected exactly one open PR"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
+}
+
+/// Explicit base bypasses gh.
+#[test]
+fn explicit_base_bypasses_gh() {
+    let fixture = Fixture::new();
+    fixture.fake_gh("exit 99");
+    fixture.invoke(&["--base", "main"]);
+}
+
 /// Failed fetch does not rebase.
 #[test]
 fn failed_fetch_does_not_rebase() {
@@ -449,6 +483,50 @@ fn forwarded_help_works_outside_repository() {
     fixture.assert_not_pushed();
 }
 
+/// Gh resolves selected branch.
+#[test]
+fn gh_resolves_selected_branch() {
+    let fixture = Fixture::new();
+    fixture.fake_gh(&format!("test \"$*\" = \"pr list --repo {} --head feature --state open --limit 2 --json baseRefName --jq .[].baseRefName\" || exit 3\nprintf \"main\\n\"", path(&fixture.remote)));
+    fixture.git(&["switch", "main"]);
+    fixture.invoke(&["feature"]);
+    assert_eq!(fixture.rev("feature^"), fixture.base);
+}
+
+/// Missing pr fails before mutation.
+#[test]
+fn missing_pr_fails_before_mutation() {
+    let fixture = Fixture::new();
+    fixture.fake_gh("echo 'no PR found' >&2; exit 1");
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke_result(&[]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("pass --base explicitly"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
+}
+
+/// Multiple prs fail before mutation.
+#[test]
+fn multiple_prs_fail_before_mutation() {
+    let fixture = Fixture::new();
+    fixture.fake_gh("printf \"main\\nother\\n\"");
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke_result(&[]);
+    assert_eq!(result.code, FAILURE);
+    assert!(
+        result.stderr.contains("expected exactly one open PR"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
+}
+
 /// Multiple push mappings are rejected.
 #[test]
 fn multiple_push_mappings_are_rejected() {
@@ -478,6 +556,22 @@ fn multiple_push_urls_are_rejected() {
     ]);
     let result = fixture.invoke_result(&["--base", "main"]);
     assert_ne!(result.code, SUCCESS);
+    fixture.assert_not_pushed();
+}
+
+/// Numeric branch uses head filter.
+#[test]
+fn numeric_branch_uses_head_filter() {
+    let fixture = Fixture::new();
+    fixture.git(&["branch", "123", "refs/heads/feature"]);
+    fixture.git(&["push", "origin", "refs/heads/123:refs/heads/123"]);
+    fixture.fake_gh(&format!("test \"$*\" = \"pr list --repo {} --head 123 --state open --limit 2 --json baseRefName --jq .[].baseRefName\" || exit 3\nprintf \"main\\n\"", path(&fixture.remote)));
+    fixture.invoke(&["123"]);
+    assert_eq!(fixture.rev("refs/heads/123^"), fixture.base);
+    assert_eq!(
+        fixture.rev("refs/heads/123"),
+        fixture.rev_at("refs/heads/123", &fixture.remote)
+    );
     fixture.assert_not_pushed();
 }
 
@@ -569,6 +663,26 @@ fn selected_branch_updates_local_refs_only() {
         fixture.git(&["branch", "--show-current"]).stdout.trim(),
         "feature"
     );
+}
+
+/// Silent query failure reports status.
+#[test]
+fn silent_query_failure_reports_status() {
+    let fixture = Fixture::new();
+    fixture.fake_gh("exit 7");
+    let before = fixture.git(&["show-ref"]).stdout;
+    let result = fixture.invoke_result(&[]);
+    assert_eq!(result.code, FAILURE);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        format!(
+            "error: could not resolve the PR base for feature; pass --base explicitly: gh pr list --repo {} --head feature --state open --limit 2 --json baseRefName --jq .[].baseRefName failed: exit status: 7; stderr: \"\"\n",
+            path(&fixture.remote)
+        )
+    );
+    assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+    fixture.assert_not_pushed();
 }
 
 /// Tag collision preserves current branch identity.

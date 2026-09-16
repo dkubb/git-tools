@@ -250,7 +250,7 @@ use std::io;
 use std::process::{Command, ExitCode};
 use thiserror::Error;
 
-/// Rebase onto the explicitly selected base, then push the selected branch.
+/// Rebase onto the latest fetched PR base, then push the selected branch.
 ///
 /// Select a repository with `git -C <path> push-up`. Both branches must
 /// already exist on origin. The selected local branch must include its remote
@@ -260,9 +260,9 @@ use thiserror::Error;
 #[derive(Debug, Parser)]
 #[command(name = "git-push-up")]
 struct Args {
-    /// Immediate base branch.
+    /// Immediate base branch (defaults to the selected branch's GitHub PR base).
     #[arg(long)]
-    base: String,
+    base: Option<String>,
     /// Local branch to publish (defaults to the checked-out branch).
     branch: Option<String>,
     /// Print the plan without fetching, rebasing, or pushing.
@@ -273,6 +273,14 @@ struct Args {
 /// Failures that stop publication.
 #[derive(Debug, Error)]
 enum Error {
+    /// An explicit base is needed when PR discovery cannot resolve one.
+    #[error("could not resolve the PR base for {branch}; pass --base explicitly: {details}")]
+    Base {
+        /// Branch whose PR could not be resolved.
+        branch: String,
+        /// Discovery failure to report to the caller.
+        details: String,
+    },
     /// A subprocess rejected the requested operation.
     #[error("{command} failed: {details}")]
     Command {
@@ -461,9 +469,46 @@ fn record(text: &str) -> Result<&str, Error> {
     Ok(value)
 }
 
-/// Validate the explicitly selected base branch.
-fn resolve_base(args: &Args) -> Result<BranchName, Error> {
-    BranchName::try_new(&args.base)
+/// Resolve only the selected branch's PR; never guess a default base.
+fn resolve_base(args: &Args, source: &BranchName) -> Result<BranchName, Error> {
+    let branch = source.as_str();
+    if let Some(base) = args.base.as_ref() {
+        return BranchName::try_new(base);
+    }
+    let output = query(
+        "gh",
+        &[
+            "pr",
+            "list",
+            "--repo",
+            record(&query("git", &["remote", "get-url", "origin"])?)?,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--limit",
+            "2",
+            "--json",
+            "baseRefName",
+            "--jq",
+            ".[].baseRefName",
+        ],
+    )
+    .map_err(|error| Error::Base {
+        branch: branch.to_owned(),
+        details: error.to_string(),
+    })?;
+    let base = record(&output).map_err(|error| Error::Base {
+        branch: branch.to_owned(),
+        details: format!("expected exactly one open PR: {error}"),
+    })?;
+    if base.is_empty() {
+        return Err(Error::Base {
+            branch: branch.to_owned(),
+            details: "PR has no base branch".to_owned(),
+        });
+    }
+    BranchName::try_new(base)
 }
 
 /// Confirm a published tip is included before rewriting it.
@@ -590,7 +635,7 @@ fn run(args: &Args) -> Result<(), Error> {
             &format!("refs/heads/{}", branch.as_str()),
         ],
     )?;
-    let base = resolve_base(args)?;
+    let base = resolve_base(args, &branch)?;
     let target = RebaseTarget::new(branch, base)?;
     if args.dry_run {
         print_plan(target.branch().as_str(), target.base().as_str());
