@@ -101,6 +101,8 @@ mod domain {
         base: BranchName,
         /// Branch being published.
         branch: BranchName,
+        /// Explicit remote destination; absence means the source name.
+        destination: Option<BranchName>,
     }
 
     impl RebaseTarget {
@@ -113,12 +115,24 @@ mod domain {
         pub(super) const fn branch(&self) -> &BranchName {
             &self.branch
         }
-        /// Admit only distinct source and base identities.
-        pub(super) fn new(branch: BranchName, base: BranchName) -> Result<Self, Error> {
-            if branch == base {
+        /// Borrow the remote branch identity.
+        pub(super) fn destination(&self) -> &BranchName {
+            self.destination.as_ref().unwrap_or(&self.branch)
+        }
+        /// Admit only source and destination identities distinct from the base.
+        pub(super) fn new(
+            branch: BranchName,
+            destination: Option<BranchName>,
+            base: BranchName,
+        ) -> Result<Self, Error> {
+            if branch == base || destination.as_ref() == Some(&base) {
                 return Err(Error::SameBranch);
             }
-            Ok(Self { base, branch })
+            Ok(Self {
+                base,
+                branch,
+                destination,
+            })
         }
     }
 }
@@ -138,7 +152,7 @@ mod tests {
         reason = "Proptest assertions require successful valid fixtures"
     )]
     mod properties {
-        use super::{BranchName, CommitId, RebaseTarget, fetched_commit, record};
+        use super::{BranchName, CommitId, RebaseTarget, fetched_commit, parse_selection, record};
         use proptest::prelude::{any, prop_assert, prop_assert_eq, proptest};
         use std::process::Command;
 
@@ -160,12 +174,23 @@ mod tests {
             fn target_requires_distinct_branches(left in "[a-z]{1,32}", right in "[a-z]{1,32}") {
                 let source = BranchName::try_new(&left).unwrap();
                 let base = BranchName::try_new(&right).unwrap();
-                let target = RebaseTarget::new(source, base);
+                let target = RebaseTarget::new(source, None, base);
                 prop_assert_eq!(target.is_ok(), left != right);
                 if let Ok(value) = target {
                     prop_assert_eq!(value.branch().as_str(), left);
                     prop_assert_eq!(value.base().as_str(), right);
                 }
+            }
+
+            #[test]
+            fn refspec_roundtrip(source in "[a-z]{1,32}", destination in "[a-z]{1,32}") {
+                let input = format!("{source}:{destination}");
+                let (branch, remote) = parse_selection(&input).unwrap();
+                prop_assert_eq!(branch.as_str(), source);
+                let remote_branch = remote.unwrap();
+                prop_assert_eq!(remote_branch.as_str(), destination.as_str());
+                let deletion = format!(":{destination}");
+                prop_assert!(parse_selection(&deletion).is_err());
             }
 
             #[test]
@@ -177,6 +202,12 @@ mod tests {
                 prop_assert!(fetched_commit(&output, "refs/remotes/other/branch").is_err());
                 let duplicate = format!("{output}{output}");
                 prop_assert!(fetched_commit(&duplicate, &reference).is_err());
+            }
+
+            #[test]
+            fn target_rejects_destination_base_collision(source in "[a-z]{1,32}", destination in "[a-z]{1,32}", base in "[a-z]{1,32}") {
+                let target = RebaseTarget::new(BranchName::try_new(&source).unwrap(), Some(BranchName::try_new(&destination).unwrap()), BranchName::try_new(&base).unwrap());
+                prop_assert_eq!(target.is_ok(), source != base && destination != base);
             }
 
             #[test]
@@ -203,7 +234,9 @@ mod tests {
         }
     }
 
-    use super::{BranchName, CommitId, Error, RebaseTarget, fetched_commit, record};
+    use super::{
+        BranchName, CommitId, Error, RebaseTarget, fetched_commit, parse_selection, record,
+    };
 
     /// Pin grammar, framing, ID lengths, and target inequality at their boundaries.
     #[test]
@@ -234,6 +267,7 @@ mod tests {
         assert!(matches!(
             RebaseTarget::new(
                 BranchName::try_new("main").unwrap(),
+                None,
                 BranchName::try_new("main").unwrap()
             ),
             Err(Error::SameBranch)
@@ -255,15 +289,16 @@ use thiserror::Error;
 /// Select a repository with `git -C <path> push-up`. Both branches must
 /// already exist on origin. The selected local branch must include its remote
 /// tip before rewriting. A successful rebase leaves that branch checked out.
-/// Other local branches may move through --update-refs; only this branch is pushed.
+/// Other local branches may move through --update-refs; only the selected destination is pushed.
 /// Requires Git with fetch --porcelain support.
 #[derive(Debug, Parser)]
 #[command(name = "git-push-up")]
 struct Args {
-    /// Immediate base branch (defaults to the selected branch's GitHub PR base).
+    /// Immediate base branch (defaults to the destination branch's GitHub PR base).
     #[arg(long)]
     base: Option<String>,
-    /// Local branch to publish (defaults to the checked-out branch).
+    /// Local source, optionally SOURCE:DESTINATION; HEAD means the current branch.
+    #[arg(value_name = "SOURCE[:DESTINATION]")]
     branch: Option<String>,
     /// Print the plan without fetching, rebasing, or pushing.
     #[arg(long)]
@@ -341,7 +376,7 @@ enum Error {
     )]
     PushConfiguration(&'static str),
     /// Source and base cannot refer to the same branch.
-    #[error("the source branch and base must differ")]
+    #[error("source and destination must differ from the base")]
     SameBranch,
 }
 
@@ -528,13 +563,19 @@ fn require_ancestor(ancestor: &str, branch: &str) -> Result<(), Error> {
     clippy::print_stdout,
     reason = "Dry-run output is the requested CLI result"
 )]
-fn print_plan(branch: &str, base: &str) {
-    println!("Fetch origin/{base} and origin/{branch}");
-    println!("Require a clean worktree and inclusion of origin/{branch}");
+fn print_plan(target: &RebaseTarget) {
+    let branch = target.branch().as_str();
+    let base = target.base().as_str();
+    let destination = target.destination().as_str();
+    println!("Fetch origin/{base} and origin/{destination}");
+    println!("Require a clean worktree and inclusion of origin/{destination}");
     println!("Rebase {branch} onto the fetched origin/{base} with --update-refs");
-    println!("Push only {branch} to origin with --force-with-lease --force-if-includes");
+    println!(
+        "Push only {branch}:{destination} to origin with --force-with-lease --force-if-includes"
+    );
 }
 
+/// Extract exactly one fetched object ID from Git's immutable porcelain output.
 /// Reading tracking refs instead would admit a concurrent background fetch.
 fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
     let mut matches = output.lines().filter_map(|line| {
@@ -554,12 +595,13 @@ fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
 fn publish(target: &RebaseTarget) -> Result<(), Error> {
     let branch = target.branch().as_str();
     let base = target.base().as_str();
+    let destination = target.destination().as_str();
     if !query("git", &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
         return Err(Error::DirtyWorktree);
     }
     let local_ref = format!("refs/heads/{branch}");
     let base_ref = format!("refs/remotes/origin/{base}");
-    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let remote_ref = format!("refs/remotes/origin/{destination}");
     let fetched = query(
         "git",
         &[
@@ -574,7 +616,7 @@ fn publish(target: &RebaseTarget) -> Result<(), Error> {
             "--no-tags",
             "origin",
             &format!("+refs/heads/{base}:{base_ref}"),
-            &format!("+refs/heads/{branch}:{remote_ref}"),
+            &format!("+refs/heads/{destination}:{remote_ref}"),
         ],
     )?;
     let base_commit = fetched_commit(&fetched, &base_ref)?;
@@ -605,7 +647,7 @@ fn publish(target: &RebaseTarget) -> Result<(), Error> {
         "--force-if-includes",
         "--no-follow-tags",
         "origin",
-        &format!("{local_ref}:{local_ref}"),
+        &format!("{local_ref}:refs/heads/{destination}"),
     ])
 }
 
@@ -618,6 +660,31 @@ fn current_branch() -> Result<String, Error> {
     Ok(name.to_owned())
 }
 
+/// Resolve only supported branch refspecs, preserving their exact spelling.
+fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Error> {
+    let (source, destination_input) = input
+        .split_once(':')
+        .map_or((input, None), |(source, destination)| {
+            (source, Some(destination))
+        });
+    if source.starts_with('+') {
+        return Err(Error::InvalidBranch);
+    }
+    let source_name = if source == "HEAD" {
+        current_branch().map_err(|error| Error::Head(Box::new(error)))?
+    } else {
+        source
+            .strip_prefix("refs/heads/")
+            .unwrap_or(source)
+            .to_owned()
+    };
+    let branch = BranchName::try_new(&source_name)?;
+    let destination = destination_input
+        .map(|name| BranchName::try_new(name.strip_prefix("refs/heads/").unwrap_or(name)))
+        .transpose()?;
+    Ok((branch, destination))
+}
+
 /// Resolve inputs before crossing the mutation boundary.
 fn run(args: &Args) -> Result<(), Error> {
     query("git", &["rev-parse", "--show-toplevel"])?;
@@ -626,7 +693,7 @@ fn run(args: &Args) -> Result<(), Error> {
         Some(branch) => branch.clone(),
         None => current_branch().map_err(|error| Error::Head(Box::new(error)))?,
     };
-    let branch = BranchName::try_new(&input)?;
+    let (branch, destination) = parse_selection(&input)?;
     query(
         "git",
         &[
@@ -635,10 +702,10 @@ fn run(args: &Args) -> Result<(), Error> {
             &format!("refs/heads/{}", branch.as_str()),
         ],
     )?;
-    let base = resolve_base(args, &branch)?;
-    let target = RebaseTarget::new(branch, base)?;
+    let base = resolve_base(args, destination.as_ref().unwrap_or(&branch))?;
+    let target = RebaseTarget::new(branch, destination, base)?;
     if args.dry_run {
-        print_plan(target.branch().as_str(), target.base().as_str());
+        print_plan(&target);
         return Ok(());
     }
     publish(&target)

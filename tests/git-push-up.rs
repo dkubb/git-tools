@@ -333,6 +333,21 @@ fn current_branch_rebases_and_pushes() {
     assert_ne!(fixture.rev("feature"), fixture.old_feature);
 }
 
+/// Detached head refspec is rejected.
+#[test]
+fn detached_head_refspec_is_rejected() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "--detach"]);
+    let result = fixture.invoke_result(&["--base", "main", "HEAD:feature"]);
+    assert_ne!(result.code, SUCCESS);
+    assert!(
+        result.stderr.contains("pass a branch explicitly"),
+        "{}",
+        result.stderr
+    );
+    fixture.assert_not_pushed();
+}
+
 /// Detached head requires a selected branch.
 #[test]
 fn detached_head_requires_a_selected_branch() {
@@ -423,6 +438,29 @@ fn explicit_base_bypasses_gh() {
     fixture.invoke(&["--base", "main"]);
 }
 
+/// Explicit destination uses its pr.
+#[test]
+fn explicit_destination_uses_its_pr() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "temporary"]);
+    fixture.fake_gh("test \"$6\" = feature || exit 3; printf \"main\\n\"");
+    fixture.invoke(&["temporary:feature"]);
+    assert_eq!(fixture.rev("temporary^"), fixture.base);
+    assert_eq!(
+        fixture.rev("temporary"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    assert_ne!(
+        fixture
+            .git_result_at(
+                &["show-ref", "--verify", "refs/heads/temporary"],
+                &fixture.remote
+            )
+            .code,
+        SUCCESS
+    );
+}
+
 /// Failed fetch does not rebase.
 #[test]
 fn failed_fetch_does_not_rebase() {
@@ -491,6 +529,41 @@ fn gh_resolves_selected_branch() {
     fixture.git(&["switch", "main"]);
     fixture.invoke(&["feature"]);
     assert_eq!(fixture.rev("feature^"), fixture.base);
+}
+
+/// Head source resolves current branch.
+#[test]
+fn head_source_resolves_current_branch() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "-c", "temporary"]);
+    fixture.invoke(&["--base", "main", "HEAD:feature"]);
+    assert_eq!(
+        fixture.rev("temporary"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    assert_eq!(fixture.rev("temporary^"), fixture.base);
+}
+
+/// Invalid refspecs fail before mutation.
+#[test]
+fn invalid_refspecs_fail_before_mutation() {
+    let fixture = Fixture::new();
+    let before = fixture.git(&["show-ref"]).stdout;
+    for refspec in [
+        ":feature",
+        "feature:",
+        ":",
+        "feature:other:third",
+        "*:feature",
+        "+feature:feature",
+        "HEAD~1:feature",
+        "feature:main",
+    ] {
+        let result = fixture.invoke_result(&["--base", "main", refspec]);
+        assert_ne!(result.code, SUCCESS);
+        assert_eq!(fixture.git(&["show-ref"]).stdout, before);
+        fixture.assert_not_pushed();
+    }
 }
 
 /// Missing pr fails before mutation.
