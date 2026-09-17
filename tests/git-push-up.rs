@@ -1298,3 +1298,216 @@ fn upstream_destination_can_have_another_name() {
     );
     assert_eq!(fixture.rev("feature"), fixture.old_feature);
 }
+
+/// Author identity and timezone survive normalization, base advances, and repeated pushes.
+#[test]
+fn metadata_is_stable_across_repeated_pushes_and_new_bases() {
+    let fixture = Fixture::new();
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--author",
+        "Original Author <original@example.invalid>",
+        "--date",
+        "1000000000 +0530",
+    ]);
+    fixture.commit("second", "second", "Add second");
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--author",
+        "Second Author <second@example.invalid>",
+        "--date",
+        "1000000001 -0330",
+    ]);
+    fixture.git(&["branch", "sibling"]);
+    fixture.commit("third", "third", "Add third");
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--author",
+        "Third Author <third@example.invalid>",
+        "--date",
+        "1000000010 +1245",
+    ]);
+    fixture.git(&["push", "--force", "origin", "feature"]);
+    let merged = fixture.git(&["merge-tree", "--write-tree", "feature", "main"]);
+    let expected_tree = merged.stdout.strip_suffix('\n').unwrap();
+    fixture.invoke(&["--base", "main"]);
+    let expected = "Original Author <original@example.invalid>|1000000000|2001-09-09 07:16:40 +0530|Original Author <original@example.invalid>|1000000000|2001-09-09 07:16:40 +0530\nSecond Author <second@example.invalid>|1000000001|2001-09-08 22:16:41 -0330|Second Author <second@example.invalid>|1000000001|2001-09-08 22:16:41 -0330\nThird Author <third@example.invalid>|1000000010|2001-09-09 14:31:50 +1245|Third Author <third@example.invalid>|1000000010|2001-09-09 14:31:50 +1245\n";
+    let format = "--format=%an <%ae>|%at|%ai|%cn <%ce>|%ct|%ci";
+    assert_eq!(
+        fixture
+            .git(&["log", "--reverse", format, "origin/main..feature"])
+            .stdout,
+        expected
+    );
+    assert_eq!(fixture.rev("sibling"), fixture.rev("feature^"));
+    assert_eq!(fixture.rev("feature^{tree}"), expected_tree);
+    let first = fixture.git(&["rev-list", "origin/main..feature"]).stdout;
+    fixture.git(&["config", "user.name", "Different Operator"]);
+    fixture.git(&["config", "user.email", "different@example.invalid"]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(
+        fixture.git(&["rev-list", "origin/main..feature"]).stdout,
+        first
+    );
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+    fixture.git(&["switch", "main"]);
+    fixture.commit("new-base", "new base", "Advance base again");
+    fixture.git(&["push", "origin", "main"]);
+    fixture.git(&["switch", "feature"]);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(
+        fixture
+            .git(&["log", "--reverse", format, "origin/main..feature"])
+            .stdout,
+        expected
+    );
+    assert_eq!(fixture.rev("sibling"), fixture.rev("feature^"));
+    let rebased = fixture.git(&["rev-list", "origin/main..feature"]).stdout;
+    assert_ne!(rebased, first);
+    fixture.invoke(&["--base", "main"]);
+    assert_eq!(
+        fixture.git(&["rev-list", "origin/main..feature"]).stdout,
+        rebased
+    );
+}
+
+/// Replacement leaves siblings untouched while normalizing both metadata timestamps.
+#[test]
+fn replacement_metadata_is_idempotent() {
+    let fixture = Fixture::new();
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--date",
+        "1000000000 +0000",
+    ]);
+    fixture.git(&["branch", "sibling"]);
+    let sibling = fixture.rev("sibling");
+    fixture.invoke(&["--replace", "--base", "main"]);
+    let first = fixture.rev("feature");
+    assert_eq!(
+        fixture
+            .git(&["show", "--no-patch", "--format=%at %ai|%ct %ci", "feature"])
+            .stdout,
+        "1000000000 2001-09-09 01:46:40 +0000|1000000000 2001-09-09 01:46:40 +0000\n"
+    );
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("feature"), first);
+    assert_eq!(fixture.rev("sibling"), sibling);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), first);
+}
+
+/// A patch subsumed by the base must never cause the callback to rewrite upstream.
+#[test]
+fn dropped_first_commit_does_not_normalize_base() {
+    let fixture = Fixture::new();
+    fixture.git(&["switch", "main"]);
+    fs::write(fixture.repo.join("feature.txt"), "feature").unwrap();
+    fixture.git(&["add", "feature.txt"]);
+    fixture.commit(
+        "also-upstream",
+        "upstream",
+        "Include feature with another change",
+    );
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--date",
+        "1000000000 +0530",
+    ]);
+    fixture.git(&["push", "origin", "main"]);
+    let base = fixture.rev("main");
+    fixture.git(&["switch", "feature"]);
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("feature"), base);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), base);
+    assert_eq!(fixture.rev_at("main", &fixture.remote), base);
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("feature"), base);
+}
+
+/// A metadata rewrite preserves message bytes, including deliberate whitespace.
+#[test]
+fn metadata_preserves_commit_message_bytes() {
+    let fixture = Fixture::new();
+    let message = fixture.root.path().join("message");
+    fs::write(&message, "Subject  \n\nbody  \n\n\n").unwrap();
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--cleanup=verbatim",
+        "--file",
+        path(&message),
+        "--date",
+        "1000000000 +0530",
+    ]);
+    let before = fixture
+        .git(&["show", "--no-patch", "--format=%B", "feature"])
+        .stdout;
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(
+        fixture
+            .git(&["show", "--no-patch", "--format=%B", "feature"])
+            .stdout,
+        before
+    );
+}
+
+/// Continuing a conflicted rebase still normalizes metadata without publishing.
+#[test]
+fn conflict_continue_normalizes_metadata() {
+    let fixture = Fixture::new();
+    fixture.git(&[
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--date",
+        "1000000000 +0530",
+    ]);
+    fixture.git(&["switch", "main"]);
+    fixture.commit("feature.txt", "conflicting base", "Conflict with feature");
+    fixture.git(&["push", "origin", "main"]);
+    fixture.git(&["switch", "feature"]);
+    assert_eq!(
+        fixture.invoke_result(&["--replace", "--base", "main"]).code,
+        FAILURE
+    );
+    fs::write(fixture.repo.join("feature.txt"), "resolved").unwrap();
+    fixture.git(&["add", "feature.txt"]);
+    fixture.git(&["rebase", "--continue"]);
+    assert_eq!(
+        fixture
+            .git(&["show", "--no-patch", "--format=%at %ai|%ct %ci", "feature"])
+            .stdout,
+        "1000000000 2001-09-09 07:16:40 +0530|1000000000 2001-09-09 07:16:40 +0530\n"
+    );
+    fixture.assert_not_pushed();
+    let resumed = fixture.rev("feature");
+    fixture.invoke(&["--replace", "--base", "main"]);
+    assert_eq!(fixture.rev("feature"), resumed);
+    assert_eq!(fixture.rev_at("feature", &fixture.remote), resumed);
+}
+
+/// Rebase callbacks quote executable paths containing shell syntax literally.
+#[test]
+fn metadata_callback_quotes_executable_path() {
+    let fixture = Fixture::new();
+    let executable = fixture.root.path().join("push ' $ (literal)");
+    fs::copy(binary(), &executable).unwrap();
+    fixture.command(path(&executable), &["--base", "main"], &fixture.repo);
+    assert_eq!(
+        fixture.rev("feature"),
+        fixture.rev_at("feature", &fixture.remote)
+    );
+}
