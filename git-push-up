@@ -213,6 +213,20 @@ mod metadata {
     }
 
     impl Date {
+        /// Advance only within the branch, retaining the author's timezone.
+        fn after(&self, previous: Option<u64>) -> Result<Self, Error> {
+            let seconds = match previous {
+                Some(parent) if self.seconds <= parent => {
+                    parent.checked_add(1).ok_or(Error::InvalidMetadata)?
+                }
+                _ => self.seconds,
+            };
+            Ok(Self {
+                seconds,
+                offset: self.offset.clone(),
+            })
+        }
+
         /// Git's raw date input keeps the timezone rather than consulting local TZ.
         fn raw(&self) -> String {
             format!("{} {}", self.seconds, self.offset)
@@ -244,9 +258,28 @@ mod metadata {
     )]
     mod tests {
         use super::Date;
-        /// Reject malformed timestamps and numeric offsets before amendment.
+        use proptest::prelude::{prop_assert_eq, proptest};
+
+        proptest! {
+            #[test]
+            fn normalization_is_idempotent(seconds in 0..u64::MAX, previous in 0..u64::MAX, offset in "[+-][0-9]{4}") {
+                let original = Date::try_new(&seconds.to_string(), &offset).unwrap();
+                let normalized = original.after(Some(previous)).unwrap();
+                prop_assert_eq!(normalized.seconds, seconds.max(previous.checked_add(1).unwrap()));
+                prop_assert_eq!(&normalized.offset, &offset);
+                prop_assert_eq!(&normalized.after(Some(previous)).unwrap(), &normalized);
+                prop_assert_eq!(original.after(None).unwrap(), original);
+                prop_assert_eq!(Date::try_new(&normalized.seconds.to_string(), &normalized.offset).unwrap(), normalized);
+            }
+        }
+
+        /// Equal timestamps advance by one; exhausted timestamps fail without wrapping.
         #[test]
         fn boundaries() {
+            let date = Date::try_new("0", "+0530").unwrap();
+            assert_eq!(date.after(None).unwrap().raw(), "0 +0530");
+            assert_eq!(date.after(Some(0)).unwrap().raw(), "1 +0530");
+            date.after(Some(u64::MAX)).unwrap_err();
             for invalid in ["", "-1", "+1", "1 ", "18446744073709551616"] {
                 Date::try_new(invalid, "+0000").unwrap_err();
             }
@@ -326,7 +359,7 @@ mod metadata {
             committer_iso,
             parent_value,
         ] = fields;
-        CommitId::try_new(parent_value)?;
+        let parent = CommitId::try_new(parent_value)?;
         let author = Signature::try_new(name, email, seconds, iso)?;
         let committer = Signature::try_new(
             committer_name,
@@ -334,10 +367,25 @@ mod metadata {
             committer_seconds,
             committer_iso,
         )?;
-        if author == committer {
+        let previous = if parent.as_str() == base.as_str() {
+            None
+        } else {
+            let value = query(
+                "git",
+                &["show", "--no-patch", "--format=%at", parent.as_str()],
+            )?;
+            Some(
+                record(&value)?
+                    .parse()
+                    .map_err(|_error| Error::InvalidMetadata)?,
+            )
+        };
+        let date = author.date.after(previous)?;
+        if author == committer && author.date == date {
             return Ok(());
         }
-        amend(&author)
+        let normalized = Signature { date, ..author };
+        amend(&normalized)
     }
 
     /// Amend metadata only, bypassing hooks, staged files, and signing configuration.
@@ -539,7 +587,8 @@ use thiserror::Error;
 /// Default mode can move other local branches through --update-refs. Replacement
 /// mode disables that behavior. Only the selected destination is pushed.
 /// Committer identity matches the author. Both dates use the author timestamp
-/// and timezone. The upstream parent date does not change branch dates.
+/// and timezone, advancing by one second only when needed after another branch
+/// commit. The first branch commit ignores the upstream parent date.
 /// Requires Git with fetch --porcelain support.
 #[derive(Debug, Parser)]
 #[command(name = "git-push-up")]
@@ -998,6 +1047,7 @@ fn print_plan(target: &RebaseTarget, remote: &Remote, replace: bool) {
     );
     println!("Require a clean worktree");
     println!("Match committer metadata to the author; retain author timezones");
+    println!("Keep the first branch date; advance later dates only to follow the previous commit");
     if replace {
         println!(
             "Mode: replacement; PR lookup uses destination {destination} when --base is absent"

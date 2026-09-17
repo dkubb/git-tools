@@ -1320,7 +1320,7 @@ fn metadata_is_stable_across_repeated_pushes_and_new_bases() {
         "--author",
         "Second Author <second@example.invalid>",
         "--date",
-        "1000000001 -0330",
+        "999999999 -0330",
     ]);
     fixture.git(&["branch", "sibling"]);
     fixture.commit("third", "third", "Add third");
