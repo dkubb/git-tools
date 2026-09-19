@@ -1,0 +1,1197 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [package]
+//! edition = "2024"
+//!
+//! [dependencies]
+//! clap = { version = "4.5.50", features = ["derive"] }
+//! thiserror = "2.0.17"
+//!
+//! [dev-dependencies]
+//! proptest = "1.6"
+//! tempfile = "3.23"
+//! wait-timeout = "0.2"
+//! ```
+//!
+//! Fetch a PR base, rebase a local branch, and publish with lease protection.
+
+#![forbid(unsafe_code)]
+#![deny(warnings)]
+#![deny(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![expect(
+    clippy::blanket_clippy_restriction_lints,
+    reason = "Enable restriction lints with explicit exceptions for this CLI"
+)]
+#![deny(clippy::restriction)]
+#![expect(
+    clippy::implicit_return,
+    reason = "Tail expressions are idiomatic Rust"
+)]
+#![expect(
+    clippy::question_mark_used,
+    reason = "Propagate typed failures to the CLI boundary"
+)]
+#![expect(
+    clippy::single_call_fn,
+    reason = "Named workflow steps keep the command readable"
+)]
+#![expect(
+    clippy::cargo_common_metadata,
+    reason = "rust-script generates an unpublished package"
+)]
+
+extern crate alloc;
+
+/// Domain values are constructed only through this module's parsers.
+#[expect(
+    clippy::pub_with_shorthand,
+    reason = "Use idiomatic restricted visibility"
+)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "Keep constructors restricted if module visibility changes"
+)]
+mod domain {
+    use super::{Error, config, query, record};
+
+    /// Git owns the grammar; a private constructor preserves its evidence.
+    /// The 1024-byte operational cap is estimated, not a Git protocol limit.
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) struct BranchName(String);
+
+    impl BranchName {
+        /// Borrow the original spelling at the subprocess boundary.
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+        /// Preserve the name exactly after checking bounds and Git's grammar.
+        pub(super) fn try_new(value: &str) -> Result<Self, Error> {
+            if value.is_empty() || value.len() > 1024 || value.starts_with('-') {
+                return Err(Error::InvalidBranch);
+            }
+            query("git", &["check-ref-format", &format!("refs/heads/{value}")])?;
+            Ok(Self(value.to_owned()))
+        }
+    }
+
+    /// A full SHA-1 or SHA-256 object ID, never a mutable ref or revision expression.
+    pub(super) struct CommitId(String);
+
+    impl CommitId {
+        /// Borrow the canonical ID for Git arguments.
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+        /// Parse Git's full lowercase hexadecimal object ID representation.
+        pub(super) fn try_new(value: &str) -> Result<Self, Error> {
+            if !matches!(value.len(), 40 | 64)
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(Error::InvalidCommit);
+            }
+            Ok(Self(value.to_owned()))
+        }
+    }
+
+    /// Exactly one source and one distinct base, without duplicated ref strings.
+    pub(super) struct RebaseTarget {
+        /// Immediate parent branch.
+        base: BranchName,
+        /// Branch being published.
+        branch: BranchName,
+        /// Explicit remote destination; absence means the source name.
+        destination: Option<BranchName>,
+    }
+
+    impl RebaseTarget {
+        /// Borrow the parent identity.
+        pub(super) const fn base(&self) -> &BranchName {
+            &self.base
+        }
+
+        /// Borrow the publication identity.
+        pub(super) const fn branch(&self) -> &BranchName {
+            &self.branch
+        }
+        /// Borrow the remote branch identity.
+        pub(super) fn destination(&self) -> &BranchName {
+            self.destination.as_ref().unwrap_or(&self.branch)
+        }
+        /// Admit only source and destination identities distinct from the base.
+        pub(super) fn new(
+            branch: BranchName,
+            destination: Option<BranchName>,
+            base: BranchName,
+        ) -> Result<Self, Error> {
+            if branch == base || destination.as_ref() == Some(&base) {
+                return Err(Error::SameBranch);
+            }
+            Ok(Self {
+                base,
+                branch,
+                destination,
+            })
+        }
+    }
+    /// One named remote with one shared fetch/push endpoint.
+    /// Separate or multiple push URLs cannot share this command's atomic fetch.
+    pub(super) struct Remote {
+        /// Validated name in Git's remote-tracking namespace.
+        name: BranchName,
+        /// Endpoint used to scope GitHub PR lookup.
+        url: String,
+    }
+
+    impl Remote {
+        /// Borrow the configured remote name.
+        pub(super) fn name(&self) -> &str {
+            self.name.as_str()
+        }
+
+        /// Reject configurations that cannot be covered by one fetched lease.
+        pub(super) fn try_new(value: &str) -> Result<Self, Error> {
+            let name = BranchName::try_new(value)?;
+            let mirror = query(
+                "git",
+                &[
+                    "config",
+                    "--type=bool",
+                    "--default=false",
+                    "--get",
+                    &format!("remote.{value}.mirror"),
+                ],
+            )?;
+            if record(&mirror)? == "true" {
+                return Err(Error::PushConfiguration("mirror remotes are unsupported"));
+            }
+            let fetch = query("git", &["remote", "get-url", "--all", value])?;
+            let push = query("git", &["remote", "get-url", "--push", "--all", value])?;
+            let url = record(&fetch)?;
+            if url.is_empty() || record(&push)? != url {
+                return Err(Error::PushConfiguration(
+                    "one identical fetch/push URL is required",
+                ));
+            }
+            // Validate cardinality even when a CLI refspec overrides the mapping.
+            if let Some(spec) = config(&format!("remote.{value}.push"))?
+                && (spec.contains('*') || spec.starts_with(':') || spec.starts_with('+'))
+            {
+                return Err(Error::PushConfiguration(
+                    "push defaults must name one branch without force, wildcards, or deletion",
+                ));
+            }
+            Ok(Self {
+                name,
+                url: url.to_owned(),
+            })
+        }
+
+        /// Borrow the repository endpoint for PR discovery.
+        pub(super) fn url(&self) -> &str {
+            &self.url
+        }
+    }
+}
+
+/// Normalize each replay before Git records its final update-refs destination.
+#[expect(clippy::pub_with_shorthand, reason = "Keep the callback internal")]
+#[expect(clippy::redundant_pub_crate, reason = "Keep visibility restricted")]
+mod metadata {
+    use super::{CommitId, Error, query, record, require_ancestor};
+    use std::env;
+    use std::process::Command;
+
+    /// An absolute instant and its original numeric timezone spelling.
+    #[derive(Debug, Eq, PartialEq)]
+    struct Date {
+        /// Numeric offset as written by the author, including its sign.
+        offset: String,
+        /// Absolute seconds since the Unix epoch.
+        seconds: u64,
+    }
+
+    impl Date {
+        /// Advance only within the branch, retaining the author's timezone.
+        fn after(&self, previous: Option<u64>) -> Result<Self, Error> {
+            let seconds = match previous {
+                Some(parent) if self.seconds <= parent => {
+                    parent.checked_add(1).ok_or(Error::InvalidMetadata)?
+                }
+                _ => self.seconds,
+            };
+            Ok(Self {
+                seconds,
+                offset: self.offset.clone(),
+            })
+        }
+
+        /// Git's raw date input keeps the timezone rather than consulting local TZ.
+        fn raw(&self) -> String {
+            format!("{} {}", self.seconds, self.offset)
+        }
+        /// Admit only Git's nonnegative raw timestamps and numeric offsets.
+        fn try_new(timestamp: &str, offset: &str) -> Result<Self, Error> {
+            let bytes = offset.as_bytes();
+            if timestamp.is_empty()
+                || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+                || bytes.len() != 5
+                || !matches!(bytes.first(), Some(b'+' | b'-'))
+                || !bytes.iter().skip(1).all(u8::is_ascii_digit)
+            {
+                return Err(Error::InvalidMetadata);
+            }
+            let seconds = timestamp.parse().map_err(|_error| Error::InvalidMetadata)?;
+            Ok(Self {
+                seconds,
+                offset: offset.to_owned(),
+            })
+        }
+    }
+
+    /// Date arithmetic is independent of wall-clock time and timezone conversion.
+    #[cfg(test)]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Valid date fixtures must construct successfully"
+    )]
+    mod tests {
+        use super::Date;
+        use proptest::prelude::{prop_assert_eq, proptest};
+
+        proptest! {
+            #[test]
+            fn normalization_is_idempotent(seconds in 0..u64::MAX, previous in 0..u64::MAX, offset in "[+-][0-9]{4}") {
+                let original = Date::try_new(&seconds.to_string(), &offset).unwrap();
+                let normalized = original.after(Some(previous)).unwrap();
+                prop_assert_eq!(normalized.seconds, seconds.max(previous.checked_add(1).unwrap()));
+                prop_assert_eq!(&normalized.offset, &offset);
+                prop_assert_eq!(&normalized.after(Some(previous)).unwrap(), &normalized);
+                prop_assert_eq!(original.after(None).unwrap(), original);
+                prop_assert_eq!(Date::try_new(&normalized.seconds.to_string(), &normalized.offset).unwrap(), normalized);
+            }
+        }
+
+        /// Equal timestamps advance by one; exhausted timestamps fail without wrapping.
+        #[test]
+        fn boundaries() {
+            let date = Date::try_new("0", "+0530").unwrap();
+            assert_eq!(date.after(None).unwrap().raw(), "0 +0530");
+            assert_eq!(date.after(Some(0)).unwrap().raw(), "1 +0530");
+            date.after(Some(u64::MAX)).unwrap_err();
+            for invalid in ["", "-1", "+1", "1 ", "18446744073709551616"] {
+                Date::try_new(invalid, "+0000").unwrap_err();
+            }
+            for invalid in ["", "0000", "+000", "+00000", "+0x00", "\u{2212}0330"] {
+                Date::try_new("1", invalid).unwrap_err();
+            }
+        }
+    }
+
+    /// One identity and its timestamp, without conflating author and committer.
+    #[derive(Eq, PartialEq)]
+    struct Signature {
+        /// Time and timezone belonging to this identity.
+        date: Date,
+        /// Original email address.
+        email: String,
+        /// Original display name.
+        name: String,
+    }
+
+    impl Signature {
+        /// Decode the identity and the original timezone emitted by Git.
+        fn try_new(name: &str, email: &str, seconds: &str, iso: &str) -> Result<Self, Error> {
+            let (_, offset) = iso.rsplit_once(' ').ok_or(Error::InvalidMetadata)?;
+            Ok(Self {
+                name: name.to_owned(),
+                email: email.to_owned(),
+                date: Date::try_new(seconds, offset)?,
+            })
+        }
+    }
+
+    /// Quote only the executable path; the other shell argument is a validated SHA.
+    pub(super) fn callback(base: &str) -> Result<String, Error> {
+        let executable = env::current_exe().map_err(|source| Error::Io {
+            program: "current executable".to_owned(),
+            source,
+        })?;
+        let path = executable.to_str().ok_or(Error::InvalidMetadata)?;
+        Ok(format!(
+            "'{}' --normalize-commit {base}",
+            path.replace('\'', "'\\''")
+        ))
+    }
+
+    /// This callback also runs when the user resumes a conflicted rebase.
+    pub(super) fn normalize(base: &CommitId) -> Result<(), Error> {
+        require_ancestor(base.as_str(), "HEAD")?;
+        // An emptied first patch can leave an exec step positioned on the base.
+        let head = query("git", &["rev-parse", "HEAD"])?;
+        if record(&head)? == base.as_str() {
+            return Ok(());
+        }
+        let metadata = query(
+            "git",
+            &[
+                "show",
+                "--no-patch",
+                "--no-show-signature",
+                "--format=%an%x00%ae%x00%at%x00%ai%x00%cn%x00%ce%x00%ct%x00%ci%x00%P",
+                "HEAD",
+            ],
+        )?;
+        let fields: [&str; 9] = record(&metadata)?
+            .split('\0')
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_error| Error::InvalidMetadata)?;
+        let [
+            name,
+            email,
+            seconds,
+            iso,
+            committer_name,
+            committer_email,
+            committer_seconds,
+            committer_iso,
+            parent_value,
+        ] = fields;
+        let parent = CommitId::try_new(parent_value)?;
+        let author = Signature::try_new(name, email, seconds, iso)?;
+        let committer = Signature::try_new(
+            committer_name,
+            committer_email,
+            committer_seconds,
+            committer_iso,
+        )?;
+        let previous = if parent.as_str() == base.as_str() {
+            None
+        } else {
+            let value = query(
+                "git",
+                &["show", "--no-patch", "--format=%at", parent.as_str()],
+            )?;
+            Some(
+                record(&value)?
+                    .parse()
+                    .map_err(|_error| Error::InvalidMetadata)?,
+            )
+        };
+        let date = author.date.after(previous)?;
+        if author == committer && author.date == date {
+            return Ok(());
+        }
+        let normalized = Signature { date, ..author };
+        amend(&normalized)
+    }
+
+    /// Amend metadata only, bypassing hooks, staged files, and signing configuration.
+    fn amend(author: &Signature) -> Result<(), Error> {
+        let date = author.date.raw();
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--amend",
+                "--only",
+                "--no-edit",
+                "--cleanup=verbatim",
+                "--allow-empty",
+                "--allow-empty-message",
+                "--no-verify",
+                "--no-post-rewrite",
+                "--no-gpg-sign",
+                "--reset-author",
+            ])
+            .env("GIT_AUTHOR_NAME", &author.name)
+            .env("GIT_AUTHOR_EMAIL", &author.email)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_NAME", &author.name)
+            .env("GIT_COMMITTER_EMAIL", &author.email)
+            .env("GIT_COMMITTER_DATE", &date)
+            .status()
+            .map_err(|source| Error::Io {
+                program: "git commit".to_owned(),
+                source,
+            })?;
+        if !status.success() {
+            return Err(Error::Command {
+                command: "git commit --amend".to_owned(),
+                details: status.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Real Git subprocess integration tests.
+#[cfg(test)]
+#[path = "tests/git-push-up.rs"]
+mod integration;
+
+/// Boundary examples and generated preservation properties.
+#[cfg(test)]
+mod tests {
+
+    /// Generated names retain every byte after parsing and framing.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Proptest assertions require successful valid fixtures"
+    )]
+    mod properties {
+        use super::{BranchName, CommitId, RebaseTarget, fetched_commit, parse_selection, record};
+        use proptest::prelude::{any, prop_assert, prop_assert_eq, proptest};
+        use std::process::Command;
+
+        proptest! {
+            #[test]
+            fn branch_roundtrip(value in any::<String>()) {
+                let expected = Command::new("git")
+                    .args(["check-ref-format", &format!("refs/heads/{value}")])
+                    .output().is_ok_and(|output| output.status.success())
+                    && !value.starts_with('-') && !value.is_empty() && value.len() <= 1024;
+                let parsed = BranchName::try_new(&value);
+                prop_assert_eq!(parsed.is_ok(), expected);
+                if let Ok(name) = parsed {
+                    prop_assert_eq!(name.as_str(), value.as_str());
+                }
+            }
+
+            #[test]
+            fn target_requires_distinct_branches(left in "[a-z]{1,32}", right in "[a-z]{1,32}") {
+                let source = BranchName::try_new(&left).unwrap();
+                let base = BranchName::try_new(&right).unwrap();
+                let target = RebaseTarget::new(source, None, base);
+                prop_assert_eq!(target.is_ok(), left != right);
+                if let Ok(value) = target {
+                    prop_assert_eq!(value.branch().as_str(), left);
+                    prop_assert_eq!(value.base().as_str(), right);
+                }
+            }
+
+            #[test]
+            fn refspec_roundtrip(source in "[a-z]{1,32}", destination in "[a-z]{1,32}") {
+                let input = format!("{source}:{destination}");
+                let (branch, remote) = parse_selection(&input).unwrap();
+                prop_assert_eq!(branch.as_str(), source);
+                let remote_branch = remote.unwrap();
+                prop_assert_eq!(remote_branch.as_str(), destination.as_str());
+                let deletion = format!(":{destination}");
+                prop_assert!(parse_selection(&deletion).is_err());
+            }
+
+            #[test]
+            fn fetched_commit_preserves_snapshot(commit in "[0-9a-f]{40}|[0-9a-f]{64}", branch in "[a-z]{1,32}") {
+                let reference = format!("refs/remotes/origin/{branch}\u{a0}");
+                let output = format!("= {commit} {commit} {reference}\n");
+                let parsed = fetched_commit(&output, &reference).unwrap();
+                prop_assert_eq!(parsed.as_str(), commit);
+                prop_assert!(fetched_commit(&output, "refs/remotes/other/branch").is_err());
+                let duplicate = format!("{output}{output}");
+                prop_assert!(fetched_commit(&duplicate, &reference).is_err());
+            }
+
+            #[test]
+            fn target_rejects_destination_base_collision(source in "[a-z]{1,32}", destination in "[a-z]{1,32}", base in "[a-z]{1,32}") {
+                let target = RebaseTarget::new(BranchName::try_new(&source).unwrap(), Some(BranchName::try_new(&destination).unwrap()), BranchName::try_new(&base).unwrap());
+                prop_assert_eq!(target.is_ok(), source != base && destination != base);
+            }
+
+            #[test]
+            fn commit_roundtrip(value in "[0-9a-f]{40}|[0-9a-f]{64}") {
+                let parsed = CommitId::try_new(&value).unwrap();
+                prop_assert_eq!(parsed.as_str(), value);
+            }
+
+            #[test]
+            fn commit_rejects_invalid(value in "[g-z]{40}|[0-9a-f]{0,39}|[0-9a-f]{41,63}|[0-9a-f]{65,80}") {
+                prop_assert!(CommitId::try_new(&value).is_err());
+            }
+
+            #[test]
+            fn record_preserves_unicode(value in any::<String>()) {
+                let framed = format!("{value}\n");
+                let parsed = record(&framed);
+                if value.contains('\n') || value.contains('\r') {
+                    prop_assert!(parsed.is_err());
+                } else {
+                    prop_assert_eq!(parsed.unwrap(), value);
+                }
+            }
+        }
+    }
+
+    use super::{
+        BranchName, CommitId, Error, RebaseTarget, fetched_commit, parse_selection, record,
+    };
+
+    /// Pin grammar, framing, ID lengths, and target inequality at their boundaries.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "A rejected valid fixture must fail the test"
+    )]
+    fn boundaries() {
+        for value in ["", "-x", "a..b", "a b", "a\n", "a.lock"] {
+            BranchName::try_new(value).unwrap_err();
+        }
+        for value in ["a", "feature\u{a0}"] {
+            assert_eq!(BranchName::try_new(value).unwrap().as_str(), value);
+        }
+        let maximum = format!("{}a", "a/".repeat(511));
+        BranchName::try_new(&maximum).unwrap();
+        BranchName::try_new(&format!("{maximum}a")).unwrap();
+        BranchName::try_new(&format!("{maximum}aa")).unwrap_err();
+        for length in [0, 39, 41, 63, 65] {
+            assert!(CommitId::try_new(&"a".repeat(length)).is_err());
+        }
+        for length in [40, 64] {
+            CommitId::try_new(&"a".repeat(length)).unwrap();
+        }
+        record("main").unwrap_err();
+        record("main\nother\n").unwrap_err();
+        assert_eq!(record("feature\u{a0}\n").unwrap(), "feature\u{a0}");
+        assert!(matches!(
+            RebaseTarget::new(
+                BranchName::try_new("main").unwrap(),
+                None,
+                BranchName::try_new("main").unwrap()
+            ),
+            Err(Error::SameBranch)
+        ));
+    }
+}
+
+use alloc::string::FromUtf8Error;
+use clap::Parser;
+use core::iter::once;
+use domain::{BranchName, CommitId, RebaseTarget, Remote};
+use std::env;
+use std::io;
+use std::process::{Command, ExitCode};
+use thiserror::Error;
+
+/// Rebase onto the latest fetched PR base, then push the selected branch.
+///
+/// Select a repository with `git -C <path> push-up`. Both branches must
+/// already exist on the resolved push remote. Git push defaults select one branch
+/// when no source is supplied; the push remote follows the checked-out branch, as in git push.
+/// Mirror, wildcard, multiple-ref and separate-push-URL configurations are rejected.
+/// The selected local branch must include its remote
+/// tip before rewriting unless --replace is supplied. A successful rebase leaves
+/// that branch checked out and rewritten even if the subsequent push fails.
+/// Default mode can move other local branches through --update-refs. Replacement
+/// mode disables that behavior. Only the selected destination is pushed.
+/// Committer identity matches the author. Both dates use the author timestamp
+/// and timezone, advancing by one second only when needed after another branch
+/// commit. The first branch commit ignores the upstream parent date.
+/// Requires Git with fetch --porcelain support.
+#[derive(Debug, Parser)]
+#[command(name = "git-push-up")]
+struct Args {
+    /// Immediate base branch (defaults to the destination branch's GitHub PR base).
+    #[arg(long)]
+    base: Option<String>,
+    /// Local source, optionally SOURCE:DESTINATION; HEAD means the current branch.
+    #[arg(value_name = "SOURCE[:DESTINATION]")]
+    branch: Option<String>,
+    /// Print the plan without fetching, rebasing, or pushing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Internal rebase callback; the argument pins the first commit's parent.
+    #[arg(long, hide = true, conflicts_with_all = ["base", "branch", "dry_run", "replace"])]
+    normalize_commit: Option<String>,
+    /// Replace non-ancestral destination history using a lease pinned at fetch.
+    /// Does not move other local branches through --update-refs.
+    #[arg(long)]
+    replace: bool,
+}
+
+/// Failures that stop publication.
+#[derive(Debug, Error)]
+enum Error {
+    /// An explicit base is needed when PR discovery cannot resolve one.
+    #[error("could not resolve the PR base for {branch}; pass --base explicitly: {details}")]
+    Base {
+        /// Branch whose PR could not be resolved.
+        branch: String,
+        /// Discovery failure to report to the caller.
+        details: String,
+    },
+    /// A subprocess rejected the requested operation.
+    #[error("{command} failed: {details}")]
+    Command {
+        /// Program and arguments for the failed operation.
+        command: String,
+        /// Subprocess diagnostics or exit status.
+        details: String,
+    },
+    /// The worktree cannot safely be rewritten.
+    #[error("a clean worktree is required; commit or stash changes first")]
+    DirtyWorktree,
+    /// Git or GitHub returned text that cannot be interpreted safely.
+    #[error("{program} returned invalid UTF-8: {source}")]
+    Encoding {
+        /// Program producing the invalid text.
+        program: String,
+        /// Original decoding failure.
+        source: FromUtf8Error,
+    },
+    /// HEAD is detached or could not be read.
+    #[error("cannot resolve the current branch; pass a branch explicitly: {0}")]
+    Head(Box<Self>),
+    /// A branch violates the supported grammar or operational byte limit.
+    #[error("invalid branch name (expected 1..=1024 bytes and Git branch grammar)")]
+    InvalidBranch,
+    /// Git returned something other than a full object ID.
+    #[error("invalid full commit ID")]
+    InvalidCommit,
+    /// Git returned metadata outside the supported canonical representation.
+    #[error("invalid commit metadata or timestamp overflow")]
+    InvalidMetadata,
+    /// Subprocess output did not contain exactly one protocol record.
+    #[error("expected exactly one newline-terminated output record")]
+    InvalidRecord,
+    /// A subprocess could not be started or awaited.
+    #[error("could not run {program}: {source}")]
+    Io {
+        /// Program that could not complete.
+        program: String,
+        /// Original operating system error.
+        source: io::Error,
+    },
+    /// Linear rebase would flatten merge history.
+    #[error(
+        "the selected branch contains merge commits above the base; a linear branch is required"
+    )]
+    MergeHistory,
+    /// An ancestry requirement failed, preserving the original failure.
+    #[error("{branch} must include {ancestor} before proceeding; integrate it first: {source}")]
+    NotAncestor {
+        /// Required ancestor identity.
+        ancestor: String,
+        /// Source ref being checked.
+        branch: String,
+        /// Git's original diagnostic.
+        source: Box<Self>,
+    },
+    /// Git defaults did not describe a supported single-branch publication.
+    #[error(
+        "unsupported push configuration: {0}; specify SOURCE:DESTINATION or adjust Git configuration"
+    )]
+    PushConfiguration(&'static str),
+    /// Source and base cannot refer to the same branch.
+    #[error("source and destination must differ from the base")]
+    SameBranch,
+}
+
+/// Publication policies carry only the evidence needed by their push command.
+enum Publication<'fetched> {
+    /// Require remote ancestry and Git's reflog-based inclusion protection.
+    Integrate,
+    /// Authorize replacement only while the fetched destination tip is unchanged.
+    Replace(&'fetched CommitId),
+}
+
+impl Publication<'_> {
+    /// Rewritten history deliberately need not include the previous destination.
+    const fn inclusion_option(&self) -> &str {
+        match *self {
+            Self::Integrate => "--force-if-includes",
+            Self::Replace(_) => "--no-force-if-includes",
+        }
+    }
+
+    /// Encode the lease at the Git boundary without consulting mutable refs again.
+    fn lease(&self, destination: &str) -> String {
+        match *self {
+            Self::Integrate => "--force-with-lease".to_owned(),
+            Self::Replace(expected) => format!(
+                "--force-with-lease=refs/heads/{destination}:{}",
+                expected.as_str()
+            ),
+        }
+    }
+
+    /// Replacement must not move sibling branches, even if enabled in Git config.
+    const fn update_refs_option(&self) -> &str {
+        match *self {
+            Self::Integrate => "--update-refs",
+            Self::Replace(_) => "--no-update-refs",
+        }
+    }
+}
+
+/// Read one optional configuration value without losing subprocess failures.
+fn config(key: &str) -> Result<Option<String>, Error> {
+    optional_query(&["config", "--get-all", key])?
+        .map(|value| record(&value).map(str::to_owned))
+        .transpose()
+}
+
+/// Git uses status one to signal a missing config key or detached symbolic HEAD.
+fn optional_query(args: &[&str]) -> Result<Option<String>, Error> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|source| Error::Io {
+            program: "git".to_owned(),
+            source,
+        })?;
+    let missing: i32 = 1;
+    if output.status.code() == Some(missing) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(Error::Command {
+            command: format!("git {}", args.join(" ")),
+            details: format!(
+                "{}; stderr: {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        });
+    }
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .map_err(|source| Error::Encoding {
+            program: "git".to_owned(),
+            source,
+        })
+}
+
+/// Follow Git's push-remote precedence and sole-remote/origin fallback.
+fn resolve_remote() -> Result<Remote, Error> {
+    let head = optional_query(&["symbolic-ref", "--quiet", "HEAD"])?;
+    let current = head
+        .as_deref()
+        .map(record)
+        .transpose()?
+        .map(|name| name.strip_prefix("refs/heads/").ok_or(Error::InvalidBranch))
+        .transpose()?;
+    if let Some(branch) = current
+        && let Some(name) = config(&format!("branch.{branch}.pushRemote"))?
+    {
+        return Remote::try_new(&name);
+    }
+    if let Some(name) = config("remote.pushDefault")? {
+        return Remote::try_new(&name);
+    }
+    if let Some(branch) = current
+        && let Some(name) = config(&format!("branch.{branch}.remote"))?
+    {
+        return Remote::try_new(&name);
+    }
+    Remote::try_new(&fallback_remote()?)
+}
+
+/// Git uses the sole configured remote, otherwise origin.
+fn fallback_remote() -> Result<String, Error> {
+    let remotes = query("git", &["remote"])?;
+    Ok(record(&remotes).unwrap_or("origin").to_owned())
+}
+
+/// Resolve only supported branch refspecs, preserving their exact spelling.
+fn parse_selection(input: &str) -> Result<(BranchName, Option<BranchName>), Error> {
+    let (source, destination_input) = input
+        .split_once(':')
+        .map_or((input, None), |(source, destination)| {
+            (source, Some(destination))
+        });
+    if source.starts_with('+') {
+        return Err(Error::InvalidBranch);
+    }
+    let source_name = if source == "HEAD" {
+        current_branch().map_err(|error| Error::Head(Box::new(error)))?
+    } else {
+        source
+            .strip_prefix("refs/heads/")
+            .unwrap_or(source)
+            .to_owned()
+    };
+    let branch = BranchName::try_new(&source_name)?;
+    let destination = destination_input
+        .map(|name| BranchName::try_new(name.strip_prefix("refs/heads/").unwrap_or(name)))
+        .transpose()?;
+    Ok((branch, destination))
+}
+
+/// Follow push.default only when the caller supplied no refspec.
+fn default_destination(branch: &BranchName, remote: &Remote) -> Result<Option<BranchName>, Error> {
+    let policy = config("push.default")?;
+    match policy.as_deref().unwrap_or("simple") {
+        "current" => Ok(None),
+        "simple" | "upstream" | "tracking" => {
+            let fetch_remote = match config(&format!("branch.{}.remote", branch.as_str()))? {
+                Some(name) => name,
+                None => fallback_remote()?,
+            };
+            let triangular = fetch_remote != remote.name();
+            let simple = policy.as_deref().unwrap_or("simple") == "simple";
+            if triangular && simple {
+                return Ok(None);
+            }
+            if triangular {
+                return Err(Error::PushConfiguration(
+                    "upstream mode requires the upstream remote",
+                ));
+            }
+            let upstream = config(&format!("branch.{}.merge", branch.as_str()))?;
+            let Some(name) = upstream else {
+                let automatic = query(
+                    "git",
+                    &[
+                        "config",
+                        "--type=bool",
+                        "--default=false",
+                        "--get",
+                        "push.autoSetupRemote",
+                    ],
+                )?;
+                return if record(&automatic)? == "true" {
+                    Ok(None)
+                } else {
+                    Err(Error::PushConfiguration(
+                        "the selected branch has no upstream",
+                    ))
+                };
+            };
+            let destination = BranchName::try_new(
+                name.strip_prefix("refs/heads/")
+                    .ok_or(Error::InvalidBranch)?,
+            )?;
+            if simple && destination != *branch {
+                return Err(Error::PushConfiguration(
+                    "simple mode requires matching upstream and local names",
+                ));
+            }
+            Ok(Some(destination))
+        }
+        "matching" => Err(Error::PushConfiguration(
+            "matching mode can publish multiple branches",
+        )),
+        "nothing" => Err(Error::PushConfiguration(
+            "push.default=nothing requires an explicit refspec",
+        )),
+        _ => Err(Error::PushConfiguration("unrecognized push.default")),
+    }
+}
+
+/// Apply a single configured push mapping or Git's default branch policy.
+fn resolve_selection(args: &Args) -> Result<(RebaseTarget, Remote), Error> {
+    let input = match args.branch.as_ref() {
+        Some(branch) => branch.clone(),
+        None => current_branch().map_err(|error| Error::Head(Box::new(error)))?,
+    };
+    let (branch, explicit_destination) = parse_selection(&input)?;
+    query(
+        "git",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", branch.as_str()),
+        ],
+    )?;
+    let remote = resolve_remote()?;
+    let mapping = config(&format!("remote.{}.push", remote.name()))?;
+    let (source, destination) = if explicit_destination.is_some() {
+        (branch, explicit_destination)
+    } else if let Some(spec) = mapping {
+        let (configured_source, configured_destination) = parse_selection(&spec)?;
+        if args.branch.is_none() || configured_source == branch {
+            (configured_source, configured_destination)
+        } else {
+            (branch, None)
+        }
+    } else if args.branch.is_none() {
+        let destination = default_destination(&branch, &remote)?;
+        (branch, destination)
+    } else {
+        (branch, None)
+    };
+    query(
+        "git",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", source.as_str()),
+        ],
+    )?;
+    let base = resolve_base(args, destination.as_ref().unwrap_or(&source), &remote)?;
+    Ok((RebaseTarget::new(source, destination, base)?, remote))
+}
+
+/// Capture subprocess output, preserving command failures and exact text decoding.
+fn query(program: &str, args: &[&str]) -> Result<String, Error> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|source| Error::Io {
+            program: program.to_owned(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::Command {
+            command: format!("{program} {}", args.join(" ")),
+            details: format!(
+                "{}; stderr: {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|source| Error::Encoding {
+        program: program.to_owned(),
+        source,
+    })
+}
+
+/// Run a Git operation with its progress and diagnostics visible to the user.
+fn git(args: &[&str]) -> Result<(), Error> {
+    let status = Command::new("git")
+        .args(args)
+        .status()
+        .map_err(|source| Error::Io {
+            program: "git".to_owned(),
+            source,
+        })?;
+    if !status.success() {
+        return Err(Error::Command {
+            command: format!("git {}", args.join(" ")),
+            details: status.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Parse exactly one newline-terminated protocol record without changing identity.
+fn record(text: &str) -> Result<&str, Error> {
+    let value = text.strip_suffix('\n').ok_or(Error::InvalidRecord)?;
+    if value.contains('\n') || value.contains('\r') {
+        return Err(Error::InvalidRecord);
+    }
+    Ok(value)
+}
+
+/// Resolve only the selected branch's PR; never guess a default base.
+fn resolve_base(args: &Args, source: &BranchName, remote: &Remote) -> Result<BranchName, Error> {
+    let branch = source.as_str();
+    if let Some(base) = args.base.as_ref() {
+        return BranchName::try_new(base);
+    }
+    let output = query(
+        "gh",
+        &[
+            "pr",
+            "list",
+            "--repo",
+            remote.url(),
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--limit",
+            "2",
+            "--json",
+            "baseRefName",
+            "--jq",
+            ".[].baseRefName",
+        ],
+    )
+    .map_err(|error| Error::Base {
+        branch: branch.to_owned(),
+        details: error.to_string(),
+    })?;
+    let base = record(&output).map_err(|error| Error::Base {
+        branch: branch.to_owned(),
+        details: format!("expected exactly one open PR: {error}"),
+    })?;
+    if base.is_empty() {
+        return Err(Error::Base {
+            branch: branch.to_owned(),
+            details: "PR has no base branch".to_owned(),
+        });
+    }
+    BranchName::try_new(base)
+}
+
+/// Confirm a published tip is included before rewriting it.
+fn require_ancestor(ancestor: &str, branch: &str) -> Result<(), Error> {
+    query("git", &["merge-base", "--is-ancestor", ancestor, branch]).map_err(|error| {
+        Error::NotAncestor {
+            ancestor: ancestor.to_owned(),
+            branch: branch.to_owned(),
+            source: Box::new(error),
+        }
+    })?;
+    Ok(())
+}
+
+/// Show the mutation boundary without depending on cached remote refs.
+#[expect(
+    clippy::print_stdout,
+    reason = "Dry-run output is the requested CLI result"
+)]
+fn print_plan(target: &RebaseTarget, remote: &Remote, replace: bool) {
+    let remote_name = remote.name();
+    let branch = target.branch().as_str();
+    let base = target.base().as_str();
+    let destination = target.destination().as_str();
+    println!("Fetch {remote_name}/{base} and {remote_name}/{destination}");
+    println!(
+        "Source: {branch}; destination: {remote_name}/{destination}; base: {remote_name}/{base}"
+    );
+    println!("Require a clean worktree");
+    println!("Match committer metadata to the author; retain author timezones");
+    println!("Keep the first branch date; advance later dates only to follow the previous commit");
+    if replace {
+        println!(
+            "Mode: replacement; PR lookup uses destination {destination} when --base is absent"
+        );
+        println!(
+            "Pin the destination SHA during fetch (unknown until execution; dry-run does not fetch)"
+        );
+        println!("Skip destination ancestry check; do not use --force-if-includes");
+        println!("Rebase {branch} onto the pinned base with --no-update-refs");
+        println!(
+            "Push only {branch}:{destination} with --force-with-lease=refs/heads/{destination}:<fetched-destination-sha>"
+        );
+    } else {
+        println!("Require inclusion of {remote_name}/{destination}");
+        println!("Rebase {branch} onto the fetched {remote_name}/{base} with --update-refs");
+        println!(
+            "Push only {branch}:{destination} to {remote_name} with --force-with-lease --force-if-includes"
+        );
+    }
+}
+
+/// Extract exactly one fetched object ID from Git's immutable porcelain output.
+/// Reading tracking refs instead would admit a concurrent background fetch.
+fn fetched_commit(output: &str, reference: &str) -> Result<CommitId, Error> {
+    let mut matches = output.lines().filter_map(|line| {
+        let fields = line.get(2..)?;
+        let (_, remaining) = fields.split_once(' ')?;
+        let (commit, name) = remaining.split_once(' ')?;
+        (name == reference).then_some(commit)
+    });
+    let commit = matches.next().ok_or(Error::InvalidRecord)?;
+    if matches.next().is_some() {
+        return Err(Error::InvalidRecord);
+    }
+    CommitId::try_new(commit)
+}
+
+/// Fetch once, pin the fetched base, then rewrite and publish only on success.
+fn publish(target: &RebaseTarget, remote: &Remote, replace: bool) -> Result<(), Error> {
+    let remote_name = remote.name();
+    let branch = target.branch().as_str();
+    let base = target.base().as_str();
+    let destination = target.destination().as_str();
+    if !query("git", &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+        return Err(Error::DirtyWorktree);
+    }
+    let local_ref = format!("refs/heads/{branch}");
+    let base_ref = format!("refs/remotes/{remote_name}/{base}");
+    let remote_ref = format!("refs/remotes/{remote_name}/{destination}");
+    let fetched = query(
+        "git",
+        &[
+            "fetch",
+            "--porcelain",
+            "--verbose",
+            "--refmap=",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--atomic",
+            "--no-tags",
+            remote_name,
+            &format!("+refs/heads/{base}:{base_ref}"),
+            &format!("+refs/heads/{destination}:{remote_ref}"),
+        ],
+    )?;
+    let base_commit = fetched_commit(&fetched, &base_ref)?;
+    let base_sha = base_commit.as_str();
+    let destination_commit = fetched_commit(&fetched, &remote_ref)?;
+    let publication = if replace {
+        Publication::Replace(&destination_commit)
+    } else {
+        require_ancestor(destination_commit.as_str(), &local_ref)?;
+        Publication::Integrate
+    };
+    let merges = query(
+        "git",
+        &["rev-list", "--merges", &format!("{base_sha}..{local_ref}")],
+    )?;
+    if !merges.is_empty() {
+        return Err(Error::MergeHistory);
+    }
+    git(&[
+        "rebase",
+        publication.update_refs_option(),
+        "--exec",
+        &metadata::callback(base_sha)?,
+        "--no-autostash",
+        "--no-autosquash",
+        "--no-rebase-merges",
+        "--no-fork-point",
+        "--empty=drop",
+        base_sha,
+        branch,
+    ])?;
+    require_ancestor(base_sha, &local_ref)?;
+    git(&[
+        "push",
+        &publication.lease(destination),
+        publication.inclusion_option(),
+        "--no-follow-tags",
+        remote_name,
+        &format!("{local_ref}:refs/heads/{destination}"),
+    ])
+}
+
+/// Resolve HEAD by its full namespace, never Git's ambiguous short spelling.
+fn current_branch() -> Result<String, Error> {
+    let output = query("git", &["symbolic-ref", "--quiet", "HEAD"])?;
+    let name = record(&output)?
+        .strip_prefix("refs/heads/")
+        .ok_or(Error::InvalidBranch)?;
+    Ok(name.to_owned())
+}
+
+/// Resolve inputs before crossing the mutation boundary.
+fn run(args: &Args) -> Result<(), Error> {
+    if let Some(base) = args.normalize_commit.as_ref() {
+        return metadata::normalize(&CommitId::try_new(base)?);
+    }
+    query("git", &["rev-parse", "--show-toplevel"])?;
+    let (target, remote) = resolve_selection(args)?;
+    if args.dry_run {
+        print_plan(&target, &remote, args.replace);
+        return Ok(());
+    }
+    publish(&target, &remote, args.replace)
+}
+
+/// Report one actionable failure and preserve a nonzero process status.
+#[expect(
+    clippy::print_stderr,
+    reason = "CLI failures must be visible to the caller"
+)]
+fn main() -> ExitCode {
+    // A leading separator forwards --help past Git's manual-page interception.
+    let mut arguments = env::args_os().skip(1).peekable();
+    drop(arguments.next_if(|argument| argument == "--"));
+    let args = Args::parse_from(once("git-push-up".into()).chain(arguments));
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
